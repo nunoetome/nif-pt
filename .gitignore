@@ -10,3 +10,6 @@ config/.env
 .vscode/
 
 .DS_Store
+venv/
+*.db
+data/
