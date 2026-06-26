@@ -92,6 +92,7 @@ GO
 
 CREATE TABLE stg_nunotome.nif_pt_stg (
     -- Chave e controlo
+    id                      BIGINT          IDENTITY(1,1) NOT NULL,
     nif                     BIGINT          NOT NULL,
     nif_valido_formato      BIT             NULL,
     data_consulta           DATETIME2       NOT NULL DEFAULT GETDATE(),
@@ -151,6 +152,6 @@ CREATE TABLE stg_nunotome.nif_pt_stg (
     creditos_left_paid      INT             NULL,
 
     -- Constraints
-    CONSTRAINT pk_nif_pt_stg PRIMARY KEY CLUSTERED (nif, data_staging)
+    CONSTRAINT pk_nif_pt_stg PRIMARY KEY CLUSTERED (id)
 );
 GO

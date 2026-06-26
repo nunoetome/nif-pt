@@ -27,6 +27,7 @@ TABELA_STAGING = cfg.get("tabela_staging", "nif_pt_stg")
 
 SQL_DDL = f"""
 CREATE TABLE IF NOT EXISTS {TABELA_STAGING} (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     nif                     INTEGER NOT NULL,
     nif_valido_formato      INTEGER,
     data_consulta           TEXT NOT NULL DEFAULT (datetime('now')),
@@ -74,9 +75,7 @@ CREATE TABLE IF NOT EXISTS {TABELA_STAGING} (
     creditos_left_day       INTEGER,
     creditos_left_hour      INTEGER,
     creditos_left_minute    INTEGER,
-    creditos_left_paid      INTEGER,
-
-    PRIMARY KEY (nif, data_staging)
+    creditos_left_paid      INTEGER
 );
 """
 
