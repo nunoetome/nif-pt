@@ -6,43 +6,24 @@ Uso:
     python consulta_nif.py <NIF>
     python consulta_nif.py 509442013
 
-A chave da API é lida do ficheiro .env (NIF-PT-KEY).
+A configuração (API base, key) é lida do config.yaml e .env via config.py.
 """
 
 import sys
 import json
 import requests
 from pathlib import Path
-
-# Tenta carregar .env se python-dotenv estiver instalado
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
-
-import os
-
-# Carrega variáveis de ambiente do ficheiro .env da pasta config
-env_path = Path(__file__).parent / "config" / ".env"
-if env_path.exists():
-    if load_dotenv:
-        load_dotenv(dotenv_path=env_path)
-    else:
-        # Fallback: parse manual simples
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, val = line.split("=", 1)
-                    os.environ.setdefault(key.strip(), val.strip())
+from config.config import get_config
 
 
-API_BASE = "http://www.nif.pt"
-API_KEY = os.getenv("NIF-PT-KEY")
+cfg = get_config("consulta_nif")
+
+API_BASE = cfg.get("api_base", "http://www.nif.pt")
+API_KEY = cfg.get("NIF_PT_KEY")
+TIMEOUT = cfg.get("timeout", 1000)
 
 
 def validar_nif(nif: str) -> bool:
-    """Valida o formato de um NIF português (9 dígitos, com dígito de controlo)."""
     if not nif.isdigit() or len(nif) != 9:
         return False
     nif_int = int(nif)
@@ -55,17 +36,6 @@ def validar_nif(nif: str) -> bool:
 
 
 def consultar_nif(nif: str) -> dict:
-    """
-    Consulta a API pública do nif.pt.
-
-    Retorna um dicionário com a estrutura:
-    {
-        "nif": "...",
-        "valido": true/false,
-        "fonte": "nif.pt",
-        "dados": { ... }  # resposta completa da API
-    }
-    """
     if not API_KEY:
         return {
             "nif": nif,
@@ -79,7 +49,7 @@ def consultar_nif(nif: str) -> dict:
     params = {"json": 1, "q": nif, "key": API_KEY}
 
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get(url, params=params, timeout=TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
     except requests.exceptions.Timeout:
@@ -101,7 +71,6 @@ def consultar_nif(nif: str) -> dict:
             "dados": data,
         }
 
-    # Extrai o registo do NIF consultado
     records = data.get("records", {})
     registo = records.get(nif, records.get(list(records.keys())[0] if records else None))
 

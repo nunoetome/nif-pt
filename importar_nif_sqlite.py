@@ -2,12 +2,14 @@
 """
 Importa o JSON do consulta_nif.py para a tabela de staging SQLite.
 
-Cria automaticamente a base de dados e a tabela nif_pt_stg se não existir.
+Cria automaticamente a base de dados e a tabela se não existir.
 O tratamento e migração para nif_pt é feito posteriormente noutro processo.
 
 Uso:
     python consulta_nif.py 509442013 | python importar_nif_sqlite.py
     python importar_nif_sqlite.py < ficheiro.json
+
+A configuração (db_path, nomes das tabelas) é lida do config.yaml via config.py.
 """
 
 import sys
@@ -15,13 +17,16 @@ import json
 import sqlite3
 from pathlib import Path
 from datetime import date, datetime
+from config.config import get_config
 
 
-DB_PATH = Path(__file__).parent / "data" / "nif_pt.db"
+cfg = get_config("importar_nif_sqlite")
 
+DB_PATH = Path(__file__).parent / cfg.get("db_path", "data/nif_pt.db")
+TABELA_STAGING = cfg.get("tabela_staging", "nif_pt_stg")
 
-SQL_DDL = """
-CREATE TABLE IF NOT EXISTS nif_pt_stg (
+SQL_DDL = f"""
+CREATE TABLE IF NOT EXISTS {TABELA_STAGING} (
     nif                     INTEGER NOT NULL,
     nif_valido_formato      INTEGER,
     data_consulta           TEXT NOT NULL DEFAULT (datetime('now')),
@@ -81,7 +86,6 @@ def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    # Cria as tabelas se não existirem
     conn.executescript(SQL_DDL)
     conn.commit()
     return conn
@@ -205,13 +209,13 @@ def main():
     cursor = conn.cursor()
 
     placeholders = ",".join("?" for _ in COLUNAS)
-    sql_insert_stg = f"INSERT INTO nif_pt_stg ({','.join(COLUNAS)}) VALUES ({placeholders})"
+    sql_insert_stg = f"INSERT INTO {TABELA_STAGING} ({','.join(COLUNAS)}) VALUES ({placeholders})"
 
     vals = [reg.get(c) for c in COLUNAS]
 
     try:
         cursor.execute(sql_insert_stg, vals)
-        print(f"NIF {nif} inserido em nif_pt_stg.", file=sys.stderr)
+        print(f"NIF {nif} inserido em {TABELA_STAGING}.", file=sys.stderr)
         conn.commit()
     except sqlite3.Error as e:
         conn.rollback()

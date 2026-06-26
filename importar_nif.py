@@ -8,55 +8,41 @@ Uso:
 
 Insere sempre em nif_pt_stg. O tratamento e migração para nif_pt
 é feito posteriormente noutro processo.
+
+A configuração (servidor, base de dados, schema, nomes das tabelas)
+é lida do config.yaml e .env via config.py.
 """
 
 import sys
 import json
-import os
-from pathlib import Path
 from datetime import date, datetime
-
-# Tenta carregar .env
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
-
-env_path = Path(__file__).parent / "nif_pt" / "config" / ".env"
-if env_path.exists():
-    if load_dotenv:
-        load_dotenv(dotenv_path=env_path)
-    else:
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, val = line.split("=", 1)
-                    os.environ.setdefault(key.strip(), val.strip())
-
+from config.config import get_config
 import pyodbc
 
 
-def connection_string() -> str:
-    """Constrói a connection string para Azure SQL."""
-    server = os.getenv("SQL_SERVER", "kiwa-pt-operations.database.windows.net")
-    database = os.getenv("SQL_DATABASE", "kiwa-pt-operations")
-    username = os.getenv("AZURE_USER", "")
-    password = os.getenv("AZURE_PALAVRA_CHAVE", "")
-    schema = os.getenv("SQL_SCHEMA", "stg_nunotome")
+cfg = get_config("importar_nif")
 
+SQL_SERVER = cfg.get("sql_server", "kiwa-pt-operations.database.windows.net")
+SQL_DATABASE = cfg.get("sql_database", "kiwa-pt-operations")
+SQL_SCHEMA = cfg.get("sql_schema", "stg_nunotome")
+SQL_DRIVER = cfg.get("sql_driver", "ODBC Driver 18 for SQL Server")
+TABELA_STAGING = f"{SQL_SCHEMA}.{cfg.get('tabela_staging', 'nif_pt_stg')}"
+AZURE_USER = cfg.get("AZURE_USER", "")
+AZURE_PALAVRA_CHAVE = cfg.get("AZURE_PALAVRA_CHAVE", "")
+
+
+def connection_string() -> str:
     return (
-        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-        f"SERVER={server};"
-        f"DATABASE={database};"
-        f"UID={username};"
-        f"PWD={password};"
+        f"DRIVER={{{SQL_DRIVER}}};"
+        f"SERVER={SQL_SERVER};"
+        f"DATABASE={SQL_DATABASE};"
+        f"UID={AZURE_USER};"
+        f"PWD={AZURE_PALAVRA_CHAVE};"
         f"Encrypt=yes;TrustServerCertificate=no;"
-    ), schema
+    )
 
 
 def extrair_cae(registo: dict) -> str | None:
-    """Extrai CAE como string, quer seja lista ou escalar."""
     cae = registo.get("cae")
     if isinstance(cae, list):
         return ",".join(str(c) for c in cae)
@@ -66,7 +52,6 @@ def extrair_cae(registo: dict) -> str | None:
 
 
 def parse_date(val) -> date | None:
-    """Converte string ISO ou timestamp para date."""
     if not val:
         return None
     if isinstance(val, date):
@@ -96,7 +81,6 @@ def parse_int(val) -> int | None:
 
 
 def mapear_registo(resultado: dict) -> dict:
-    """Mapeia o JSON de resposta para o formato das colunas SQL."""
     r = resultado.get("dados") or {}
     contactos = r.get("contacts") or {}
     estrutura = r.get("structure") or {}
@@ -146,7 +130,6 @@ def mapear_registo(resultado: dict) -> dict:
 
 
 def colunas_tabela() -> list[str]:
-    """Devolve a lista de colunas (excluindo data_consulta que tem DEFAULT)."""
     return [
         "nif", "nif_valido_formato", "consulta_origem",
         "seo_url", "title", "alias", "status", "start_date", "activity",
@@ -162,18 +145,15 @@ def colunas_tabela() -> list[str]:
 
 
 def placeholders() -> str:
-    """Devolve placeholders para INSERT."""
     return ",".join("?" for _ in colunas_tabela())
 
 
 def valores_para_insert(reg: dict) -> list:
-    """Devolve lista de valores na ordem das colunas."""
     cols = colunas_tabela()
     return [reg.get(c) for c in cols]
 
 
 def main():
-    # Lê JSON do stdin
     raw = sys.stdin.read()
     if not raw.strip():
         print("ERRO: Nenhum JSON recebido no stdin.", file=sys.stderr)
@@ -185,7 +165,6 @@ def main():
         print(f"ERRO: JSON inválido — {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Valida se a consulta foi bem sucedida
     if resultado.get("erro"):
         print(f"ERRO na consulta: {resultado['erro']}", file=sys.stderr)
         sys.exit(1)
@@ -195,22 +174,15 @@ def main():
         print("ERRO: NIF não encontrado no JSON", file=sys.stderr)
         sys.exit(1)
 
-    # Mapeia dados
     reg = mapear_registo(resultado)
 
-    # Conecta à base de dados
-    conn_str, schema = connection_string()
-    tabela_principal = f"{schema}.nif_pt"
-    tabela_staging = f"{schema}.nif_pt_stg"
-
-    # Verifica credenciais
-    if not os.getenv("AZURE_USER") or not os.getenv("AZURE_PALAVRA_CHAVE"):
+    if not AZURE_USER or not AZURE_PALAVRA_CHAVE:
         print("ERRO: AZURE_USER ou AZURE_PALAVRA_CHAVE não definidos no .env",
               file=sys.stderr)
         sys.exit(1)
 
     try:
-        conn = pyodbc.connect(conn_str, timeout=30)
+        conn = pyodbc.connect(connection_string(), timeout=30)
         conn.autocommit = False
         cursor = conn.cursor()
     except pyodbc.Error as e:
@@ -220,13 +192,13 @@ def main():
     cols = colunas_tabela()
     vals = valores_para_insert(reg)
     sql_insert_stg = (
-        f"INSERT INTO {tabela_staging} ({','.join(cols)}) "
+        f"INSERT INTO {TABELA_STAGING} ({','.join(cols)}) "
         f"VALUES ({placeholders()})"
     )
 
     try:
         cursor.execute(sql_insert_stg, vals)
-        print(f"NIF {nif} inserido em {tabela_staging}.", file=sys.stderr)
+        print(f"NIF {nif} inserido em {TABELA_STAGING}.", file=sys.stderr)
         conn.commit()
     except pyodbc.Error as e:
         conn.rollback()
