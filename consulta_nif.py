@@ -23,7 +23,7 @@ except ImportError:
 import os
 
 # Carrega variáveis de ambiente do ficheiro .env da pasta config
-env_path = Path(__file__).parent / "nif_pt" / "config" / ".env"
+env_path = Path(__file__).parent / "config" / ".env"
 if env_path.exists():
     if load_dotenv:
         load_dotenv(dotenv_path=env_path)
