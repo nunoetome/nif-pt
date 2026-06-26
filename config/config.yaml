@@ -10,11 +10,11 @@ consulta_nif:
   api_base: "http://www.nif.pt"
 
 # ==============================================================================
-# importar_nif_sqlite.py — importação para SQLite local
+# importar_nif_sqlite.py — guarda o JSON da API em SQLite local
 # ==============================================================================
 importar_nif_sqlite:
   db_path: "data/nif_pt.db"
-  tabela_staging: "nif_pt_stg"
+  tabela: "nif_pt"
 
 # ==============================================================================
 # importar_nif.py — importação para Azure SQL
