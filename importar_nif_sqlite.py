@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Importa o JSON do consulta_nif.py para uma base de dados SQLite local.
+Importa o JSON do consulta_nif.py para a tabela de staging SQLite.
 
-Cria automaticamente a base de dados e as tabelas se não existirem.
+Cria automaticamente a base de dados e a tabela nif_pt_stg se não existir.
+O tratamento e migração para nif_pt é feito posteriormente noutro processo.
 
 Uso:
     python consulta_nif.py 509442013 | python importar_nif_sqlite.py
     python importar_nif_sqlite.py < ficheiro.json
-
-Se o NIF já existir na tabela nif_pt, insere em nif_pt_stg (staging).
 """
 
 import sys
@@ -22,55 +21,6 @@ DB_PATH = Path(__file__).parent / "data" / "nif_pt.db"
 
 
 SQL_DDL = """
-CREATE TABLE IF NOT EXISTS nif_pt (
-    nif                     INTEGER PRIMARY KEY,
-    nif_valido_formato      INTEGER,
-    data_consulta           TEXT NOT NULL DEFAULT (datetime('now')),
-    consulta_origem         TEXT DEFAULT 'nif.pt',
-
-    seo_url                 TEXT,
-    title                   TEXT,
-    alias                   TEXT,
-    status                  TEXT,
-    start_date              TEXT,
-    activity                TEXT,
-
-    place_address           TEXT,
-    place_pc4               TEXT,
-    place_pc3               TEXT,
-    place_city              TEXT,
-
-    address                 TEXT,
-    pc4                     TEXT,
-    pc3                     TEXT,
-    city                    TEXT,
-
-    geo_region              TEXT,
-    geo_county              TEXT,
-    geo_parish              TEXT,
-
-    contacts_email          TEXT,
-    contacts_phone          TEXT,
-    contacts_website        TEXT,
-    contacts_fax            TEXT,
-
-    structure_nature        TEXT,
-    structure_capital       REAL,
-    structure_capital_currency TEXT,
-
-    cae                     TEXT,
-
-    racius                  TEXT,
-    portugalio              TEXT,
-
-    creditos_used           TEXT,
-    creditos_left_month     INTEGER,
-    creditos_left_day       INTEGER,
-    creditos_left_hour      INTEGER,
-    creditos_left_minute    INTEGER,
-    creditos_left_paid      INTEGER
-);
-
 CREATE TABLE IF NOT EXISTS nif_pt_stg (
     nif                     INTEGER NOT NULL,
     nif_valido_formato      INTEGER,
@@ -255,26 +205,13 @@ def main():
     cursor = conn.cursor()
 
     placeholders = ",".join("?" for _ in COLUNAS)
-    sql_insert = f"INSERT INTO nif_pt ({','.join(COLUNAS)}) VALUES ({placeholders})"
     sql_insert_stg = f"INSERT INTO nif_pt_stg ({','.join(COLUNAS)}) VALUES ({placeholders})"
 
     vals = [reg.get(c) for c in COLUNAS]
 
     try:
-        cursor.execute("SELECT 1 FROM nif_pt WHERE nif = ?", (nif,))
-        existe = cursor.fetchone()
-
-        if existe:
-            cursor.execute(sql_insert_stg, vals)
-            print(
-                f"NIF {nif} já existia em nif_pt. "
-                f"Inserido em nif_pt_stg para staging.",
-                file=sys.stderr,
-            )
-        else:
-            cursor.execute(sql_insert, vals)
-            print(f"NIF {nif} inserido em nif_pt.", file=sys.stderr)
-
+        cursor.execute(sql_insert_stg, vals)
+        print(f"NIF {nif} inserido em nif_pt_stg.", file=sys.stderr)
         conn.commit()
     except sqlite3.Error as e:
         conn.rollback()

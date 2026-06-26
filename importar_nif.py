@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Importa o JSON do consulta_nif.py para a base de dados SQL.
+Importa o JSON do consulta_nif.py para a tabela de staging na Azure SQL.
 
 Uso:
     python consulta_nif.py 509442013 | python importar_nif.py
     python importar_nif.py < ficheiro.json
 
-Se o NIF já existir na tabela nif_pt, insere em nif_pt_stg (staging)
-para posterior atualização via procedure.
+Insere sempre em nif_pt_stg. O tratamento e migração para nif_pt
+é feito posteriormente noutro processo.
 """
 
 import sys
@@ -219,31 +219,14 @@ def main():
 
     cols = colunas_tabela()
     vals = valores_para_insert(reg)
-    sql_insert = (
-        f"INSERT INTO {tabela_principal} ({','.join(cols)}) "
-        f"VALUES ({placeholders()})"
-    )
     sql_insert_stg = (
         f"INSERT INTO {tabela_staging} ({','.join(cols)}) "
         f"VALUES ({placeholders()})"
     )
 
     try:
-        # Verifica se o NIF já existe
-        cursor.execute(f"SELECT 1 FROM {tabela_principal} WHERE nif = ?", nif)
-        existe = cursor.fetchone()
-
-        if existe:
-            cursor.execute(sql_insert_stg, vals)
-            print(
-                f"NIF {nif} já existia em {tabela_principal}. "
-                f"Inserido em {tabela_staging} para staging.",
-                file=sys.stderr,
-            )
-        else:
-            cursor.execute(sql_insert, vals)
-            print(f"NIF {nif} inserido em {tabela_principal}.", file=sys.stderr)
-
+        cursor.execute(sql_insert_stg, vals)
+        print(f"NIF {nif} inserido em {tabela_staging}.", file=sys.stderr)
         conn.commit()
     except pyodbc.Error as e:
         conn.rollback()
