@@ -35,6 +35,6 @@ def get_config(script_name: str):
     config["AZURE_USER"] = os.getenv("AZURE_USER")
     config["AZURE_PALAVRA_CHAVE"] = os.getenv("AZURE_PALAVRA_CHAVE")
     config["API_TOKEN"] = os.getenv("API_TOKEN")
-
+    config["NIF_PT_KEY"] = os.getenv("NIF-PT-KEY")
 
     return config

@@ -1,156 +1,27 @@
 default:
-  retry_count: 0 #TODO: implemenatar
-  timeout: 1000 
-  sql_server_azure_esquema: "stg_nunotome"
-  sql_server_azure_database: "kiwa-pt-operations"
-  sql_server_azure_url: "kiwa-pt-operations.database.windows.net"
-
-
-executar_extracoes.py:
-  scripts:
-  - p1_download_calendar.py
-  - p2_download_packages.py
-  - p3_parse_xml.py
-  - p4_enrich_external.py
-  - p5_upload_to_sql
-
+  retry_count: 0
+  timeout: 1000
+  tempo_de_espera: 60
 
 # ==============================================================================
-# TED — Tenders Electronic Daily (União Europeia)
+# consulta_nif.py — consulta à API pública nif.pt
 # ==============================================================================
-
-executar_extracoes_ted.py:
-  scripts:
-  - ted/p1_download_calendar.py
-  - ted/p2_download_packages.py
-  - ted/p3_parse_xml.py
-  - ted/p4_enrich_external.py
-  - ted/p5_upload_to_sql.py
-
-
-ted:
-  calendar_url: "https://ted.europa.eu/pt/release-calendar/-/download/file/CSV"
-  data_folder_calendar: "C:\\Nova pasta\\Projetos\\Europa\\dados\\1_calendar"
-  data_folder_zip: "C:\\Nova pasta\\Projetos\\Europa\\dados\\2_zip"
-  data_folder_xml: "C:\\Nova pasta\\Projetos\\Europa\\dados\\3_xml"
-  data_folder_parsed: "C:\\Nova pasta\\Projetos\\Europa\\dados\\4_parsed"
-  data_folder_csv: "C:\\Nova pasta\\Projetos\\Europa\\dados\\5_csv"
-
-
-  # Calendário de publicações OJS
-  calendar:
-    url: "https://ted.europa.eu/pt/release-calendar/-/download/file/CSV"
-    # - WINDOWS VERSION
-    folder: "C:\\Nova pasta\\Projetos\\Europa\\dados\\1_calendar"
-    # - LINUX VERSION
-    #folder: "/home/kiwa-pt/scripts/ted/1_calendar"
-
-  # Pacotes XML em massa
-  packages:
-    base_url: "https://ted.europa.eu/packages"
-    # - WINDOWS VERSION
-    folder_zip: "C:\\Nova pasta\\Projetos\\Europa\\dados\\2_zip"
-    folder_xml: "C:\\Nova pasta\\Projetos\\Europa\\dados\\3_xml"
-    # - LINUX VERSION
-    #folder_zip: "/home/kiwa-pt/scripts/ted/2_zip"
-    #folder_xml: "/home/kiwa-pt/scripts/ted/3_xml"
-
-  # Parsing XML
-  parsing:
-    # - WINDOWS VERSION
-    folder_parsed: "C:\\Nova pasta\\Projetos\\Europa\\dados\\4_parsed"
-    # - LINUX VERSION
-    #folder_parsed: "/home/kiwa-pt/scripts/ted/4_parsed"
-    schemas_folder: "./ted/schemas"
-    max_retries: 3
-    retry_delay_sec: 5
-
-  # Search API (fallback / gap-fill)
-  api:
-    base_url: "https://api.ted.europa.eu/v3/notices/search"
-    max_results_per_query: 15000
-    page_size: 250
-
-  # CSV Subsets (data.europa.eu) — enriquecimento histórico
-  csv_enrich:
-    url: "https://data.europa.eu/data/datasets/ted-csv"
-    # - WINDOWS VERSION
-    folder_csv: "C:\\Nova pasta\\Projetos\\Europa\\dados\\5_csv"
-    # - LINUX VERSION
-    #folder_csv: "/home/kiwa-pt/scripts/ted/5_csv"
-    years: "2006-2023"
-
-  # SPARQL endpoint (labels e ontologia)
-  sparql:
-    endpoint: "https://data.ted.europa.eu/sparql"
-    enabled: false      # ativar quando necessário enriquecimento semântico
-
-  # Fair Usage Policy (TED)
-  rate_limits:
-    downloads_per_6min: 600
-    http_requests_per_min: 700
-    max_concurrent_downloads: 3
-    delay_between_requests_sec: 1.2
-
-  # Azure SQL
-  sql:
-    schema: "stg_ted"
-    tabela_notices: "tbl_ted_notices"
-    tabela_done_packages: "tbl_ted_done_packages"
-    tabela_enriched: "tbl_ted_enriched_fields"
-    tabela_log: "tbl_ted_log"
-    batch_size: 500
-    max_attempts: 3
-    timeout_insert: 10000
-
-  # Logging (template: Logging/logging_template.py)
-  logging:
-    log_folder: "log_files"
-    log_file: "ted_pipeline.log"
-    log_prefix: "[ted]"
-    level: "INFO"
-    max_bytes: 10485760
-    max_backup: 10
-
-  # Diretorias raiz
-  dirs:
-    # - WINDOWS VERSION
-    root: "C:\\Nova pasta\\ted\\dados"
-    # - LINUX VERSION
-    #root: "/home/kiwa-pt/scripts/ted/dados"
-
+consulta_nif:
+  api_base: "http://www.nif.pt"
 
 # ==============================================================================
-# Módulos Independentes TED
+# importar_nif_sqlite.py — guarda o JSON da API em SQLite local
 # ==============================================================================
+importar_nif_sqlite:
+  db_path: "data/nif_pt.db"
+  tabela: "nif_pt"
 
-ted_backfill_monthly:
-  enabled: true
-  years: "2006-2023"
-  package_type: "monthly"
-  max_concurrent_downloads: 3
-  scripts:
-  - ted/p1_download_calendar.py
-  - ted/p2_download_packages.py
-  - ted/p3_parse_xml.py
-  - ted/p5_upload_to_sql.py
-
-ted_backfill_daily:
-  enabled: true
-  start_date: "2024-01-01"
-  package_type: "daily"
-  scripts:
-  - ted/p1_download_calendar.py
-  - ted/p2_download_packages.py
-  - ted/p3_parse_xml.py
-  - ted/p5_upload_to_sql.py
-
-ted_daily_sync:
-  enabled: true
-  schedule: "daily"
-  scripts:
-  - ted/p1_download_calendar.py
-  - ted/p2_download_packages.py
-  - ted/p3_parse_xml.py
-  - ted/p4_enrich_external.py
-  - ted/p5_upload_to_sql.py
+# ==============================================================================
+# importar_nif.py — importação para Azure SQL
+# ==============================================================================
+importar_nif:
+  sql_server: "kiwa-pt-operations.database.windows.net"
+  sql_database: "kiwa-pt-operations"
+  sql_schema: "stg_nunotome"
+  sql_driver: "ODBC Driver 18 for SQL Server"
+  tabela_staging: "nif_pt_stg"
