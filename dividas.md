@@ -1,0 +1,2 @@
+# Duvidas para perguntar:
+

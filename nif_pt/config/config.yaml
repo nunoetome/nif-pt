@@ -1,0 +1,44 @@
+default:
+  retry_count: 0
+  timeout: 1000
+  tempo_de_espera: 60
+
+# ==============================================================================
+# consulta_nif.py — consulta à API pública nif.pt
+# ==============================================================================
+consulta_nif:
+  api_base: "http://www.nif.pt"
+
+# ==============================================================================
+# importar_nif_sqlite.py — guarda o JSON da API em SQLite local
+# ==============================================================================
+importar_nif_sqlite:
+  db_path: "data/nif_pt.db"
+  tabela: "nif_pt"
+
+# ==============================================================================
+# orquestrador.py — orquestrador de consultas com rate limiting
+#
+# Limites da API nif.pt (free tier):
+#   max_per_minute: 1   |   max_per_hour: 10
+#   max_per_day:   100  |   max_per_month: 1000
+# ==============================================================================
+orquestrador:
+  max_per_minute: 1
+  max_per_hour: 10
+  max_per_day: 100
+  max_per_month: 1000
+  pause_on_limit: 60
+  input_coluna: "nif"
+  output_sqlite: true
+  output_azure: false
+
+# ==============================================================================
+# importar_nif.py — importação para Azure SQL
+# ==============================================================================
+importar_nif:
+  sql_server: "kiwa-pt-operations.database.windows.net"
+  sql_database: "kiwa-pt-operations"
+  sql_schema: "stg_nunotome"
+  sql_driver: "ODBC Driver 18 for SQL Server"
+  tabela_staging: "nif_pt_stg"
