@@ -1,24 +1,51 @@
 #!/usr/bin/env python3
 """
-Importa o JSON do consulta_nif.py para a tabela de staging na Azure SQL.
+importar_nif — Normaliza JSON do consulta_nif.py e insere em Azure SQL staging.
+
+Lê JSON de ``stdin`` (pipeline), valida, mapeia 36 colunas via
+:func:`mapear_registo` e insere em ``{sql_schema}.{tabela_staging}``
+(``stg_nunotome.nif_pt_stg`` por defeito) via ``pyodbc`` + ``ODBC Driver 18``.
 
 Uso:
     python consulta_nif.py 509442013 | python importar_nif.py
     python importar_nif.py < ficheiro.json
+    python consulta_nif.py 509442013 > tmp.json && python importar_nif.py < tmp.json
 
-Insere sempre em nif_pt_stg. O tratamento e migração para nif_pt
-é feito posteriormente noutro processo.
+    Insere sempre em ``nif_pt_stg``. A promoção para ``nif_pt`` é feita
+    por ``MERGE`` / procedure noutro processo.
 
-A configuração (servidor, base de dados, schema, nomes das tabelas)
-é lida do config.yaml e .env via config.py.
+Configuração (``config/config.py:get_config("importar_nif")``):
+    * ``sql_server`` — ``kiwa-pt-operations.database.windows.net``
+    * ``sql_database`` — ``kiwa-pt-operations``
+    * ``sql_schema`` — ``stg_nunotome``
+    * ``sql_driver`` — ``ODBC Driver 18 for SQL Server``
+    * ``tabela_staging`` — ``nif_pt_stg``
+    * ``AZURE_USER`` / ``AZURE_PALAVRA_CHAVE`` — ``config/.env``
+
+Exemplos:
+    >>> from importar_nif import mapear_registo
+    >>> r = {"nif": "509442013", "fonte": "nif.pt", "nif_valido_formato": True,
+    ...      "dados": {"title": "X", "place": {"city": "Porto"}, "contacts": {}},
+    ...      "creditos": {"used": "free", "left": []}}
+    >>> m = mapear_registo(r)
+    >>> m["nif"], m["place_city"]
+    (509442013, 'Porto')
+
+See Also:
+    :mod:`consulta_nif`, :mod:`importar_nif_sqlite`, :mod:`utils.error_handler`
 """
 
-import sys
 import json
+import logging
+import sys
+import time
 from datetime import date, datetime
+
 from config.config import get_config
+from Logging.logging_orchestrator import setup_logging
 import pyodbc
 
+logger = logging.getLogger(__name__)
 
 cfg = get_config("importar_nif")
 
@@ -32,7 +59,28 @@ AZURE_PALAVRA_CHAVE = cfg.get("AZURE_PALAVRA_CHAVE", "")
 
 
 def connection_string() -> str:
-    return (
+    """Constrói a *connection string* ODBC para Azure SQL.
+
+    Usa ``SQL_DRIVER`` / ``SQL_SERVER`` / ``SQL_DATABASE`` / ``AZURE_USER`` /
+    ``AZURE_PALAVRA_CHAVE`` de ``config.yaml`` + ``.env``, com
+    ``Encrypt=yes;TrustServerCertificate=no;`` (exigido pelo Azure).
+
+    Returns:
+        String ``DRIVER={...};SERVER=...;DATABASE=...;UID=...;PWD=...;Encrypt=yes;...``.
+        A password **não** é logada; user é mascarado no :func:`main`.
+
+    Examples:
+        >>> cs = connection_string()  # doctest: +SKIP
+        >>> "ODBC Driver 18" in cs
+        True
+
+    Notas:
+        * TIMING ``%.2fs`` (R9) + TAG ``[db]``.
+        * ``TrustServerCertificate=no`` — falhar se certificado inválido.
+    """
+    logger.debug(f"{' connection_string() ':~^49}")
+    t = time.perf_counter()
+    cs = (
         f"DRIVER={{{SQL_DRIVER}}};"
         f"SERVER={SQL_SERVER};"
         f"DATABASE={SQL_DATABASE};"
@@ -40,47 +88,178 @@ def connection_string() -> str:
         f"PWD={AZURE_PALAVRA_CHAVE};"
         f"Encrypt=yes;TrustServerCertificate=no;"
     )
+    logger.debug("[db] connection_string() -> %.2fs (driver=%s server=%s)", time.perf_counter() - t, SQL_DRIVER, SQL_SERVER)
+    return cs
 
 
 def extrair_cae(registo: dict) -> str | None:
+    """Extrai CAE(s) do registo nif.pt como CSV.
+
+    A API devolve ``cae`` como ``list`` (ex. ``["62010","63120"]``) ou
+    ``str``. A função normaliza para string única com vírgulas.
+
+    Args:
+        registo: ``resultado["dados"]`` (dict com chave ``cae``).
+
+    Returns:
+        ``"62010,63120"`` se lista, ``str(cae)`` se string, ``None`` se
+        ausente/``None``.
+
+    Examples:
+        >>> extrair_cae({"cae": ["62010", "63120"]})
+        '62010,63120'
+        >>> extrair_cae({"cae": "62010"})
+        '62010'
+        >>> extrair_cae({}) is None
+        True
+    """
     cae = registo.get("cae")
     if isinstance(cae, list):
-        return ",".join(str(c) for c in cae)
+        joined = ",".join(str(c) for c in cae)
+        logger.debug("[map] extrair_cae lista %d -> '%s'", len(cae), joined[:80])
+        return joined
     if cae is not None:
+        logger.debug("[map] extrair_cae str -> '%s'", str(cae)[:80])
         return str(cae)
     return None
 
 
 def parse_date(val) -> date | None:
+    """Converte valor de data da API para ``datetime.date``.
+
+    Aceita ``YYYY-MM-DD`` (ISO) com ou sem ``Z`` e já-``date``. Falhas
+    devolvem ``None`` sem levantar.
+
+    Args:
+        val: Valor de ``dados.start_date`` (str, date ou falsy).
+
+    Returns:
+        ``date`` ou ``None`` se vazio / inválido.
+
+    Examples:
+        >>> parse_date("2010-05-18")
+        datetime.date(2010, 5, 18)
+        >>> parse_date("2010-05-18Z")
+        datetime.date(2010, 5, 18)
+        >>> parse_date("") is None
+        True
+        >>> parse_date(None) is None
+        True
+    """
     if not val:
         return None
     if isinstance(val, date):
         return val
     try:
-        return datetime.fromisoformat(str(val).replace("Z", "")).date()
-    except (ValueError, TypeError):
+        result = datetime.fromisoformat(str(val).replace("Z", "")).date()
+        logger.debug("[map] parse_date '%s' -> %s", val, result)
+        return result
+    except (ValueError, TypeError) as e:
+        logger.debug("[map] parse_date falha '%s': %s", val, e)
         return None
 
 
 def parse_capital(val) -> float | None:
+    """Converte capital social da API para ``float``.
+
+    A API devolve ``"248000.00"`` ou ``"248.000,00"`` (PT). A função troca
+    vírgula por ponto antes de ``float()``.
+
+    Args:
+        val: ``dados.structure.capital`` (str/float/None).
+
+    Returns:
+        ``float`` ou ``None`` se vazio / inválido.
+
+    Examples:
+        >>> parse_capital("248000.00")
+        248000.0
+        >>> parse_capital("248,50")
+        248.5
+        >>> parse_capital(None) is None
+        True
+    """
     if not val:
         return None
     try:
-        return float(str(val).replace(",", "."))
-    except (ValueError, TypeError):
+        result = float(str(val).replace(",", "."))
+        logger.debug("[map] parse_capital '%s' -> %s", val, result)
+        return result
+    except (ValueError, TypeError) as e:
+        logger.debug("[map] parse_capital falha '%s': %s", val, e)
         return None
 
 
 def parse_int(val) -> int | None:
+    """Converte valor para ``int`` de forma segura.
+
+    Usado para ``creditos.left.*``. ``None`` ou falha → ``None``.
+
+    Args:
+        val: Valor a converter.
+
+    Returns:
+        ``int`` ou ``None``.
+
+    Examples:
+        >>> parse_int("5")
+        5
+        >>> parse_int(None) is None
+        True
+        >>> parse_int("abc") is None
+        True
+    """
     if val is None:
         return None
     try:
-        return int(val)
-    except (ValueError, TypeError):
+        result = int(val)
+        return result
+    except (ValueError, TypeError) as e:
+        logger.debug("[map] parse_int falha '%s': %s", val, e)
         return None
 
 
 def mapear_registo(resultado: dict) -> dict:
+    """Mapeia o JSON normalizado de :func:`consulta_nif.consultar_nif` para 36 colunas SQL.
+
+    Desembrulha ``resultado["dados"]`` (``place``, ``geo``, ``contacts``,
+    ``structure``, ``cae``) + ``resultado["creditos"]`` e aplica
+    :func:`parse_date` / :func:`parse_capital` / :func:`parse_int` /
+    :func:`extrair_cae`. Trata o caso ``credits.left == []`` (free plan →
+    ``{}``).
+
+    Args:
+        resultado: Dict devolvido por :func:`consulta_nif.consultar_nif`
+            (``nif``, ``fonte``, ``dados``, ``creditos``, ``nif_valido_formato``).
+
+    Returns:
+        Dict com 36 chaves — ordem de :func:`colunas_tabela`:
+
+        * ``nif`` (int), ``nif_valido_formato`` (0/1), ``consulta_origem``,
+        * ``seo_url``, ``title``, ``alias``, ``status``, ``start_date`` (date|None),
+          ``activity``,
+        * ``place_address/pc4/pc3/city``, ``address/pc4/pc3/city``,
+        * ``geo_region/county/parish``,
+        * ``contacts_email/phone/website/fax``,
+        * ``structure_nature/capital/capital_currency``,
+        * ``cae`` (CSV), ``racius``, ``portugalio``,
+        * ``creditos_used``, ``creditos_left_month/day/hour/minute/paid`` (int|None).
+
+    Examples:
+        >>> r = {"nif": "509442013", "fonte": "nif.pt", "nif_valido_formato": True,
+        ...      "dados": {"title": "X", "cae": ["62010"], "place": {"city": "Porto"},
+        ...                "contacts": {"email": "a@b.pt"}, "structure": {"capital": "1000"}},
+        ...      "creditos": {"used": "free", "left": []}}
+        >>> mapear_registo(r)["cae"]
+        '62010'
+        >>> mapear_registo(r)["creditos_left_month"] is None
+        True
+
+    See Also:
+        :func:`colunas_tabela`, :func:`valores_para_insert`, :func:`extrair_cae`
+    """
+    logger.debug(f"{' mapear_registo() ':~^49}")
+    t = time.perf_counter()
     r = resultado.get("dados") or {}
     contactos = r.get("contacts") or {}
     estrutura = r.get("structure") or {}
@@ -88,8 +267,12 @@ def mapear_registo(resultado: dict) -> dict:
     place = r.get("place") or {}
     creditos = resultado.get("creditos") or {}
     creditos_left = creditos.get("left") or {}
+    if isinstance(creditos_left, list):
+        # free plan devolve [] em vez de dict
+        logger.debug("[map] creditos.left é lista vazia (free plan) -> dict vazio")
+        creditos_left = {}
 
-    return {
+    mapped = {
         "nif": parse_int(resultado.get("nif")),
         "nif_valido_formato": 1 if resultado.get("nif_valido_formato") else 0,
         "consulta_origem": resultado.get("fonte", "nif.pt"),
@@ -128,8 +311,34 @@ def mapear_registo(resultado: dict) -> dict:
         "creditos_left_paid": parse_int(creditos_left.get("paid")),
     }
 
+    logger.info(
+        "[map] 36 cols mapeadas nif=%s title=%.30s cae=%s credits used=%s left_month=%s",
+        mapped.get("nif"),
+        (mapped.get("title") or "")[:30],
+        (mapped.get("cae") or "")[:50],
+        mapped.get("creditos_used"),
+        mapped.get("creditos_left_month"),
+    )
+    logger.debug("[map] mapear_registo() -> %.2fs", time.perf_counter() - t)
+    return mapped
+
 
 def colunas_tabela() -> list[str]:
+    """Devolve a lista ordenada das 36 colunas para ``INSERT`` em ``nif_pt_stg``.
+
+    Exclui colunas com ``DEFAULT`` (``id``, ``data_consulta``,
+    ``data_staging``, ``processado``) — o ``INSERT`` omite-as intencionalmente.
+
+    Returns:
+        Lista de 36 nomes — 1 ``nif`` + 35 restantes na ordem do DDL
+        ``sql/01_criar_tabelas.sql``.
+
+    Examples:
+        >>> len(colunas_tabela())
+        36
+        >>> colunas_tabela()[:3]
+        ['nif', 'nif_valido_formato', 'consulta_origem']
+    """
     return [
         "nif", "nif_valido_formato", "consulta_origem",
         "seo_url", "title", "alias", "status", "start_date", "activity",
@@ -145,48 +354,139 @@ def colunas_tabela() -> list[str]:
 
 
 def placeholders() -> str:
+    """Gera placeholders ``?`` para ``pyodbc`` na ordem de :func:`colunas_tabela`.
+
+    Returns:
+        String ``"?,?,?,?,..."`` com 36 ``?`` separados por vírgula.
+
+    Examples:
+        >>> placeholders().count("?")
+        36
+    """
     return ",".join("?" for _ in colunas_tabela())
 
 
 def valores_para_insert(reg: dict) -> list:
+    """Extrai valores do dict mapeado na ordem de :func:`colunas_tabela`.
+
+    Args:
+        reg: Dict devolvido por :func:`mapear_registo`.
+
+    Returns:
+        Lista de 36 valores na ordem das colunas — pronta para
+        ``cursor.execute(sql, valores_para_insert(reg))``.
+
+    Examples:
+        >>> reg = {"nif": 509442013, "title": "X"}
+        >>> valores_para_insert(reg)[0]
+        509442013
+    """
     cols = colunas_tabela()
     return [reg.get(c) for c in cols]
 
 
 def main():
+    """Ponto de entrada CLI — lê JSON de stdin, mapeia e insere em Azure SQL.
+
+    Fluxo:
+
+    1. ``setup_logging()`` + BANNER ``= 49``.
+    2. ``sys.stdin.read()`` — ``exit 1`` se vazio.
+    3. ``json.loads`` — ``exit 1`` se inválido.
+    4. Se ``resultado["erro"]`` → log + ``exit 1`` (não insere).
+    5. ``mapear_registo(resultado)`` → 36 cols.
+    6. Valida ``AZURE_USER`` / ``AZURE_PALAVRA_CHAVE`` — ``exit 1`` se falta.
+    7. ``pyodbc.connect(connection_string(), timeout=30)`` com ``autocommit=False``.
+    8. ``INSERT INTO {TABELA_STAGING} (36 cols) VALUES (36 ?)`` + ``commit``
+       (``rollback`` em ``pyodbc.Error``) + BOX ``Inserido em Azure SQL``.
+
+    Args:
+        Nenhum — lê ``sys.stdin`` integralmente.
+
+    Returns:
+        Não retorna — ``sys.exit(0)`` em sucesso, ``sys.exit(1)`` em erro.
+        ``stderr`` com TAGs ``[io][map][db]``; ``stdout`` vazio.
+
+    See Also:
+        :func:`mapear_registo`, :func:`connection_string`, :func:`colunas_tabela`
+    """
+    logger_main = setup_logging()
+    logger_main.info("=" * 49)
+    logger_main.info(f"{' nif-pt importar_nif a iniciar ':=^49}")
+    logger_main.info("=" * 49)
+    t_app = time.perf_counter()
+
     raw = sys.stdin.read()
+    logger_main.debug("[io] stdin lido %d bytes", len(raw))
     if not raw.strip():
-        print("ERRO: Nenhum JSON recebido no stdin.", file=sys.stderr)
+        logger_main.error("[io] Nenhum JSON recebido no stdin (pipeline quebrado)")
+        logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
+        logger_main.info("=" * 49)
+        logger_main.info(f"{' nif-pt importar_nif finalizado ':=^49}")
+        logger_main.info("=" * 49)
         sys.exit(1)
 
     try:
         resultado = json.loads(raw)
+        logger_main.debug("[io] JSON carregado nif=%s", resultado.get("nif"))
     except json.JSONDecodeError as e:
-        print(f"ERRO: JSON inválido — {e}", file=sys.stderr)
+        logger_main.error("[io] JSON inválido: %s (preview=%.80s)", e, raw[:80])
+        logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
+        logger_main.info("=" * 49)
+        logger_main.info(f"{' nif-pt importar_nif finalizado ':=^49}")
+        logger_main.info("=" * 49)
         sys.exit(1)
 
     if resultado.get("erro"):
-        print(f"ERRO na consulta: {resultado['erro']}", file=sys.stderr)
+        logger_main.warning("[api] Erro consulta propagado: %s", resultado["erro"])
+        # mostrar também message detalhada se existir em dados
+        dados = resultado.get("dados") or {}
+        if isinstance(dados, dict) and dados.get("message"):
+            logger_main.warning("[api] Detalhe: %s", dados.get("message"))
+        logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
+        logger_main.info("=" * 49)
+        logger_main.info(f"{' nif-pt importar_nif finalizado ':=^49}")
+        logger_main.info("=" * 49)
         sys.exit(1)
 
     nif = resultado.get("nif")
     if not nif:
-        print("ERRO: NIF não encontrado no JSON", file=sys.stderr)
+        logger_main.error("[io] NIF não encontrado no JSON")
+        logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
+        logger_main.info("=" * 49)
+        logger_main.info(f"{' nif-pt importar_nif finalizado ':=^49}")
+        logger_main.info("=" * 49)
         sys.exit(1)
 
+    logger_main.debug("-" * 49)
     reg = mapear_registo(resultado)
 
     if not AZURE_USER or not AZURE_PALAVRA_CHAVE:
-        print("ERRO: AZURE_USER ou AZURE_PALAVRA_CHAVE não definidos no .env",
-              file=sys.stderr)
+        logger_main.error("[cfg] AZURE_USER ou AZURE_PALAVRA_CHAVE não definidos no config/.env")
+        logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
+        logger_main.info("=" * 49)
+        logger_main.info(f"{' nif-pt importar_nif finalizado ':=^49}")
+        logger_main.info("=" * 49)
         sys.exit(1)
 
+    logger_main.info("-" * 49)
+    logger_main.info(f"{' Inserir staging ':-^49}")
+    logger_main.info("-" * 49)
+
     try:
+        t_conn = time.perf_counter()
+        masked_user = AZURE_USER[:3] + "***" if AZURE_USER and len(AZURE_USER) > 3 else "***"
+        logger_main.info("[db] A ligar a %s/%s schema=%s user=%s driver=%s", SQL_SERVER, SQL_DATABASE, SQL_SCHEMA, masked_user, SQL_DRIVER)
         conn = pyodbc.connect(connection_string(), timeout=30)
         conn.autocommit = False
         cursor = conn.cursor()
+        logger_main.debug("[db] Ligação estabelecida em %.2fs", time.perf_counter() - t_conn)
     except pyodbc.Error as e:
-        print(f"ERRO: Falha na ligação à BD — {e}", file=sys.stderr)
+        logger_main.error("[db] Falha na ligação Azure SQL: %s", e)
+        logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
+        logger_main.info("=" * 49)
+        logger_main.info(f"{' nif-pt importar_nif finalizado ':=^49}")
+        logger_main.info("=" * 49)
         sys.exit(1)
 
     cols = colunas_tabela()
@@ -195,18 +495,45 @@ def main():
         f"INSERT INTO {TABELA_STAGING} ({','.join(cols)}) "
         f"VALUES ({placeholders()})"
     )
+    logger_main.debug("[db] SQL: %s", sql_insert_stg[:120])
 
     try:
+        t_insert = time.perf_counter()
         cursor.execute(sql_insert_stg, vals)
-        print(f"NIF {nif} inserido em {TABELA_STAGING}.", file=sys.stderr)
+        logger_main.info("[db] INSERT %s nif=%s -> 1 row em %.2fs", TABELA_STAGING, nif, time.perf_counter() - t_insert)
         conn.commit()
+        logger_main.debug("[db] commit OK")
+        # BOX sucesso
+        logger_main.info("-" * 49)
+        logger_main.info("| Inserido em Azure SQL                              |")
+        logger_main.info("|-------------------------------------------------|")
+        logger_main.info("| NIF         : %-30s |", str(nif))
+        logger_main.info("| Tabela      : %-30s |", TABELA_STAGING[:30])
+        logger_main.info("| Titulo      : %-30s |", (reg.get("title") or "")[:30])
+        logger_main.info("| CAE         : %-30s |", (reg.get("cae") or "")[:30])
+        logger_main.info("| Tempo       : %-30s |", f"{time.perf_counter() - t_app:.2f}s")
+        logger_main.info("-" * 49)
     except pyodbc.Error as e:
         conn.rollback()
-        print(f"ERRO: Falha na inserção — {e}", file=sys.stderr)
+        logger_main.error("[db] Falha inserção nif=%s: %s", nif, e)
+        logger_main.warning("[db] rollback executado")
+        logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
+        logger_main.info("=" * 49)
+        logger_main.info(f"{' nif-pt importar_nif finalizado ':=^49}")
+        logger_main.info("=" * 49)
         sys.exit(1)
     finally:
-        cursor.close()
-        conn.close()
+        try:
+            cursor.close()
+            conn.close()
+            logger_main.debug("[db] Ligação fechada")
+        except Exception:
+            pass
+
+    logger_main.info("Importar concluído em %.2fs", time.perf_counter() - t_app)
+    logger_main.info("=" * 49)
+    logger_main.info(f"{' nif-pt importar_nif finalizado ':=^49}")
+    logger_main.info("=" * 49)
 
 
 if __name__ == "__main__":
