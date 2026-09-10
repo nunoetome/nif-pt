@@ -1,9 +1,9 @@
-# Manual de Instruções — nif-pt v0.3.0
+# Manual de Instruções — nif-pt v1.0.0
 
-> Ferramenta Python para consulta de NIFs portugueses via [nif.pt](http://www.nif.pt) (`?json=1`) com validação Mod-11 e persistência SQLite / Azure SQL.
+> Ferramenta Python para consulta de NIFs portugueses via [nif.pt](http://www.nif.pt) (`?json=1`) com validação Mod-11, pipeline Unix e persistência SQLite WAL / Azure SQL + camada resiliente de rate-limit.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-v0.2.0--beta-orange.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v1.0.0-blue.svg)](CHANGELOG.md)
 
 ---
 
@@ -31,40 +31,44 @@
 
 ### 1.1 Objetivo e âmbito
 
-O `nif-pt` consulta a base pública do portal `nif.pt` e guarda o resultado localmente (SQLite) e/ou remotamente (Azure SQL). Destina-se a **pessoas coletivas** com registo público; NIFs de pessoas singulares ou recentes podem devolver `No records found` sem que isso indique erro de validação.
+`nif-pt` consulta a base pública do portal `nif.pt` (`GET ?json=1&q=<NIF>&key=<KEY>`) e guarda o resultado localmente (SQLite WAL) e/ou remotamente (Azure SQL). Destina-se a pessoas coletivas com registo público; NIFs de pessoas singulares ou recentes podem devolver `No records found`.
+
+Novidade `v1.0.0`: camada `utils/error_handler.py` (612L) classifica erros de quota, persiste em `nif_api_erros` (dual SQLite/Azure) e aplica `retry 60s` (minuto) / `3600s` (hora) com limites `max_tentativas_global 5 / minuto 3 / hora 2 / dia 0 / mes 0`.
 
 ### 1.2 Funcionalidades
 
-| ID | Funcionalidade | Estado |
-|----|----------------|--------|
-| RF-01 | Validar formato do NIF (9 dígitos, Mod-11) | ✅ `consulta_nif.py:26` |
-| RF-02 | Consultar API `nif.pt` (`?json=1&q=<NIF>&key=<KEY>`) | ✅ `consulta_nif.py:38` |
-| RF-03 | Devolver JSON normalizado (`valido`, `fonte`, `erro`, `dados`, `creditos`) | ✅ |
-| RF-04 | Guardar JSON bruto em SQLite (`data/nif_pt.db`, WAL) | ✅ `importar_nif_sqlite.py:37` |
-| RF-05 | Normalizar 36 colunas e inserir em Azure SQL `stg_nunotome.nif_pt_stg` | ✅ `importar_nif.py:83` |
-| RF-06 | Pipeline `stdin`/`stdout` com `exit code` | ✅ |
-| RF-07 | Logging estruturado (template) | 🚧 `Logging/logging_template.py:1` não integrado |
+| ID | Funcionalidade | Estado | Ficheiro |
+|----|----------------|--------|----------|
+| RF-01 | Validar NIF Mod-11 | ✅ | `consulta_nif.py:48` `validar_nif()` |
+| RF-02 | Consultar `nif.pt` (`?json=1&q=&key=`, timeout 10s) | ✅ | `consulta_nif.py:113` `requests.get` |
+| RF-03 | JSON normalizado (`valido/fonte/erro/dados/creditos/tipo_erro`) | ✅ | `consulta_nif.py:257` |
+| RF-04 | Guardar JSON bruto SQLite WAL | ✅ | `importar_nif_sqlite.py:42` `get_db()` |
+| RF-05 | Normalizar 36 cols → Azure `nif_pt_stg` | ✅ | `importar_nif.py:103` `mapear_registo()` |
+| RF-06 | Pipeline `stdin/stdout` + `exit 0/1` | ✅ | `sys.stdin.read()` |
+| RF-07 | Camada `error_handler` (6 tipos, retry/abort, `nif_api_erros`) | ✅ | `utils/error_handler.py:346` `tratar_erro()` |
+| RF-08 | Logging R1-R9 `<<nif-pt>>` `RotatingFileHandler` 10MB/5000/10 | ✅ | `Logging/logging_orchestrator.py:226` |
+| RF-09 | `help()` PEP 257 em todos os módulos | ✅ | `docs/api/help.md` |
 
 ### 1.3 Requisitos não-funcionais
 
-* **Performance:** `timeout` configurável, `PRAGMA journal_mode=WAL` no SQLite.
-* **Segurança:** chave `NIF-PT-KEY` e credenciais Azure apenas em `config/.env` (ignorado em `.gitignore:7`).
-* **Portabilidade:** `pathlib`, `pyodbc` + `ODBC Driver 18 for SQL Server`.
+* **Performance:** `timeout 10s` (`config.yaml:3`), `WAL`, `sleep 60s/3600s` em retry.
+* **Segurança:** segredos só em `config/.env` (`.gitignore`), `NIF-PT-KEY` mascarada `***XXXX` em todos os logs.
+* **Portabilidade:** `pathlib`, `pyodbc` ODBC 18, dual PowerShell 5.1 / Bash.
+* **Observabilidade:** `log_files/nif_pt.log` com BOX `| NIF : ... |` + TAG `[api][valid][cfg][db][sqlite][io][map][erro][rate-limit]` + TIMING `%.2fs`.
 
-### 1.4 Público-alvo e limitações da fonte
+### 1.4 Público-alvo e limitações
 
-Operações, compliance e data engineering que necessitem enriquecer NIFs. A fonte `nif.pt` é agregadora — pode estar desatualizada, incompleta ou com rate-limit (`creditos.left`).
+Operações, compliance, data engineering. `nif.pt` é agregadora — pode estar desatualizada, com `rate-limit` (`creditos.left`) ou sem registo (`No records found` não indica NIF inválido).
 
 ### 1.5 Histórico de versões
 
 | Versão | Data | Destaque |
 |--------|------|----------|
-| `v.0.1.0-alpha` | 2026-06-26 | Fundação: `consulta_nif.py` + `importar_nif.py` + `importar_nif_sqlite.py` + DDL Azure |
-| `v0.2.0-beta` | 2026-06-26 | Refactor: config centralizada, SQLite JSON bruto, `MANUAL.md` 310L, PK `id IDENTITY` |
-| `v0.2.1` (Unreleased) | 2026-09-10 | Fix `requirements.txt` (`yaml`→`pyyaml`, falta `python-dotenv`/`pyodbc`), `README` + `docs/` |
-| `v0.3.0-docs` (este manual) | 2026-09-10 | Documentação completa |
+| `v.0.1.0-alpha` | 2026-06-26 | Fundação `consulta_nif` + `importar_nif` + SQLite + DDL Azure |
+| `v0.2.0-beta` | 2026-06-26 | Config centralizada, SQLite JSON bruto, `MANUAL` 310L |
+| `v1.0.0` **(esta)** | 2026-09-10 | `error_handler` 612L + `nif_api_erros` dual + `logging_orchestrator` 580L + `timeout 10s` + `max_tentativas_*` + docs 15 caps |
 
-Ver [CHANGELOG.md](CHANGELOG.md) para detalhe.
+Ver [CHANGELOG.md](CHANGELOG.md) completo.
 
 ---
 
@@ -74,56 +78,80 @@ Ver [CHANGELOG.md](CHANGELOG.md) para detalhe.
 
 ```mermaid
 graph LR
-    U[Utilizador<br/>NIF 9 dígitos] --> C[consulta_nif.py<br/>validar_nif + requests]
-    C -->|stdout JSON<br/>ensure_ascii=False| S[importar_nif_sqlite.py<br/>JSON bruto]
-    C -->|stdout JSON| A[importar_nif.py<br/>36 cols normalizadas]
-    S --> DB1[(data/nif_pt.db<br/>id, nif, dados, data_consulta<br/>PRAGMA WAL)]
-    A --> DB2[(Azure SQL<br/>stg_nunotome.nif_pt_stg<br/>40 cols)]
-    DB2 -. MERGE futuro .-> DB3[(stg_nunotome.nif_pt<br/>37 cols PK nif)]
-    CFG[config.yaml + .env<br/>get_config()] -.-> C & S & A
+    U[Utilizador<br/>NIF 9 dígitos] --> C[consulta_nif.py<br/>validar_nif + requests<br/>tratar_erro]
+    C -->|stdout JSON<br/>ensure_ascii=False| S[importar_nif_sqlite.py<br/>JSON bruto WAL]
+    C -->|stdout JSON| A[importar_nif.py<br/>36 cols pyodbc]
+    C -->|erro classificado| E[(nif_api_erros<br/>SQLite + Azure)]
+    S --> DB1[(data/nif_pt.db<br/>nif_pt 4c + nif_api_erros 14c<br/>PRAGMA WAL)]
+    A --> DB2[(Azure SQL<br/>stg_nunotome.nif_pt_stg 40c)]
+    DB2 -. MERGE futuro .-> DB3[(stg_nunotome.nif_pt 37c PK nif)]
+    CFG[config.yaml 37L + .env<br/>get_config merge] -.-> C & S & A & E
+    LOG[logging_orchestrator<br/>R1-R9 <<nif-pt>>] -.-> C & S & A & E
 ```
 
-Fonte única em [docs/architecture/diagrams.md](docs/architecture/diagrams.md).
+Fonte única: [docs/technical.md](docs/technical.md) + [docs/architecture/diagrams.md](docs/architecture/diagrams.md).
 
 ### 2.2 Pipeline `stdin`/`stdout`
 
 ```
-consulta_nif.py  ──JSON──>  importar_nif_sqlite.py  (SQLite local)
-                ──JSON──>  importar_nif.py         (Azure SQL)
+consulta_nif.py  ──JSON──>  importar_nif_sqlite.py  (SQLite WAL)
+                 ──JSON──>  importar_nif.py         (Azure SQL staging)
+                 ──erro──>  nif_api_erros           (auditoria)
 ```
 
-* `consulta_nif.py` escreve **apenas JSON** em `stdout` (`consulta_nif.py:103` `json.dumps(..., indent=2, ensure_ascii=False)`); mensagens humanas vão para `stderr`.
-* Importadores leem **todo o `stdin`** (`sys.stdin.read()` em `importar_nif_sqlite.py:47` e `importar_nif.py:157`); falham com `exit 1` se `stdin` vazio ou `resultado.erro` presente.
-* `exit 0` sucesso, `exit 1` erro — permite `if ($?)` / `if [ $? -eq 0 ]`.
+* `consulta_nif.py` só JSON em `stdout` (`consulta_nif.py:318` `json.dumps(..., indent=2, ensure_ascii=False)`); humanos em `stderr` (`<<nif-pt>>`).
+* Importadores `sys.stdin.read()` → `json.loads` → `INSERT`; falham `exit 1` se `stdin` vazio ou `resultado.erro` existe (propagam erro sem inserir).
+* `nif_api_erros` persiste **sempre** antes de decidir `retry/abort` (ver §10).
 
 ### 2.3 Centralização de configuração
 
-`config/config.py:17` `get_config(script_name)` funde:
-1. `default` (`config/config.yaml:1` — `retry_count`, `timeout`, `tempo_de_espera`)
-2. Bloco específico (`consulta_nif` / `importar_nif_sqlite` / `importar_nif`)
-3. Segredos de `config/.env` (`NIF-PT-KEY`, `AZURE_USER`, `AZURE_PALAVRA_CHAVE`, `API_TOKEN`)
+`config/config.py:30` `get_config(script_name)`:
+
+1. `default` (`config.yaml:1` — 11 chaves `retry_count`, `timeout 10`, `tempo_*`, `max_tentativas_*`)
+2. Bloco do script (`consulta_nif` / `importar_nif_sqlite` / `importar_nif`)
+3. `.env` (`NIF-PT-KEY` com hífen, `AZURE_USER`, `AZURE_PALAVRA_CHAVE`, `API_TOKEN`)
 
 ```python
 cfg = get_config("consulta_nif")
 API_BASE = cfg.get("api_base", "http://www.nif.pt")
-API_KEY  = cfg.get("NIF_PT_KEY")  # vem de os.getenv("NIF-PT-KEY")
-TIMEOUT  = cfg.get("timeout", 1000)
+API_KEY  = cfg.get("NIF_PT_KEY")  # os.getenv("NIF-PT-KEY")
+TIMEOUT  = cfg.get("timeout", 10)
+MAX_GLOBAL = cfg.get("max_tentativas_global", 5)
 ```
 
-### 2.4 Decisões técnicas (ADRs)
+### 2.4 Camada de erros (v1.0.0)
+
+`utils/error_handler.py` (612L):
+
+* `classificar_erro(data)` → `rate_limit_minute/hour/day/month/paid` / `generic_error` / `unknown` (mensagem `Limit per ...` + `credits.left` com `0`).
+* `tratar_erro(nif, data, tentativas_por_tipo, tentativa_global)` → `{tipo, acao: retry|abort|none, espera: 60|3600|0, deve_retry, max_tipo, max_global}` com lógica `deve_retry = tenta_tipo < max_tipo && tenta_global < max_global`.
+* `guardar_erro(...)` → `INSERT nif_api_erros` (14 cols, WAL) sempre.
+* `init_error_table()` idempotente no arranque de `consulta_nif.py:281`.
+* `get_tempo_espera()` / `get_max_tentativas()` lidos do `config.yaml`.
+
+Fluxo `consulta_nif.py:84` `consultar_nif()`:
+
+```
+for tentativa_global in range(max_global+1):
+    try: requests.get(...)
+    except Timeout/RequestException: sleep 60s retry se <max_global
+    if result != "success": tratar_erro() -> if retry: sleep 60s/3600s continue
+                                          -> if abort: return erro+tipo_erro
+    else: return sucesso
+```
+
+Ver [docs/technical.md §10](docs/technical.md#10-camada-de-erros).
+
+### 2.5 Decisões técnicas (ADRs)
 
 | ADR | Decisão | Justificação |
 |-----|---------|--------------|
-| ADR-001 | SQLite guarda **JSON bruto** (`dados TEXT`) vs Azure normaliza 36 cols | SQLite schemaless resiste a mudanças da API; Azure normalizado permite `SELECT` analítico. Ver [docs/architecture/architecture.md](docs/architecture/architecture.md). |
-| ADR-002 | `PRAGMA journal_mode=WAL` | Resolve `database is locked` na maioria dos casos. |
-| ADR-003 | `ODBC Driver 18` com `Encrypt=yes` | Exigido pelo Azure SQL atual. |
+| ADR-001 | SQLite JSON bruto vs Azure 36 cols | WAL schemaless vs analítico |
+| ADR-002 | `WAL` | Mitiga `database is locked` |
+| ADR-003 | `ODBC 18` + `Encrypt=yes` | Exigido Azure |
+| ADR-007 | `error_handler` + `nif_api_erros` dual | Auditoria + retry `60s/3600s` vs abort |
 
-### 2.5 Estado atual e roadmap
-
-* **Funcional:** `consulta_nif.py`, `importar_nif_sqlite.py`, `importar_nif.py`, `config/`, `sql/01_criar_tabelas.sql`.
-* **Stub / reservado:** `main.py:1` (7L, só `print`), `api/__init__.py`, `models/__init__.py`, `scrapers/__init__.py`, `utils/__init__.py` (0 bytes), `Logging/logging_template.py:1` (579L, não importado).
-* **Órfão:** `suport/favicon.ico` (1150 bytes, não referenciado).
-* **Roadmap `v0.3`:** `main.py` → `cli.py` com `argparse` (`--nif`, `--to {sqlite,azure,both}`), integração logging, `api/` FastAPI, `models/` Pydantic.
+Ver [docs/technical.md §12](docs/technical.md#12-adrs) e [docs/architecture/architecture.md](docs/architecture/architecture.md).
 
 ---
 
@@ -137,22 +165,21 @@ TIMEOUT  = cfg.get("timeout", 1000)
 | `requests` | `>=2.31.0` | `pip install -r requirements.txt` | ✅ |
 | `pyyaml` | `>=6.0.1` | idem | ✅ |
 | `python-dotenv` | `>=1.0.0` | idem | ✅ |
-| `pyodbc` | `>=5.0.0` | idem | Só para `importar_nif.py` |
-| `ODBC Driver 18 for SQL Server` | 18.x | https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server | Só para Azure SQL |
+| `pyodbc` | `>=5.0.0` | idem | Só Azure |
+| `ODBC Driver 18` | 18.x | https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server | Só Azure |
 | Chave `nif.pt` | — | http://www.nif.pt/contactos/api/ | ✅ |
-
-> **Nota:** `requirements.txt` esteve quebrado até `v0.2.0-beta` (`yaml` em vez de `pyyaml`, falta `python-dotenv`/`pyodbc`). Corrigido em `v0.2.1` (`hotfix/erro_nos_requirements`).
 
 ### 3.2 Chave `NIF-PT-KEY`
 
-1. Solicitar em http://www.nif.pt/contactos/api/ (resposta por email, 1-2 dias).
-2. Copiar a chave para `config/.env` como `NIF-PT-KEY=xxxxx` (**com hífen**, `config/config.py:38`).
+1. Solicitar em http://www.nif.pt/contactos/api/ (1-2 dias por email).
+2. `config/.env` → `NIF-PT-KEY=xxxxx` **com hífen** (`config/config.py:55` `os.getenv("NIF-PT-KEY")`).
 
 ### 3.3 Azure SQL (opcional)
 
-* Servidor `kiwa-pt-operations.database.windows.net`, BD `kiwa-pt-operations`, schema `stg_nunotome` (`config/config.yaml:23`).
-* O IP local deve estar em *Firewall rules* no Portal Azure.
-* Verificar driver: `odbcinst -q -d` (Linux) ou `Get-OdbcDriver` (PowerShell).
+* `kiwa-pt-operations.database.windows.net` / `kiwa-pt-operations` / `stg_nunotome` (`config.yaml:33`).
+* Whitelist IP no Portal Azure → SQL → Networking.
+* Verificar driver: `Get-OdbcDriver` (PS) ou `odbcinst -q -d` (Linux).
+* Aplicar `sql/01_criar_tabelas.sql` (37c+40c) e `sql/02_criar_tabela_erros.sql` (14c) via SSMS/Azure Data Studio/`sqlcmd`.
 
 ---
 
@@ -163,39 +190,35 @@ TIMEOUT  = cfg.get("timeout", 1000)
 ```bash
 git clone https://github.com/nunoetome/nif-pt.git
 cd nif-pt
-git checkout prod   # estável; dev para desenvolvimento
+git checkout v1.0.0   # stable; dev para desenvolvimento
 ```
 
 ### 4.2 Criar `venv`
 
-**Git Bash (MINGW64) — o teu caso:**
-```bash
-python -m venv venv
-source venv/Scripts/activate
-# verificar:
-which python  # .../nif-pt/venv/Scripts/python.exe
-```
+**PowerShell (Windows — o teu caso):**
 
-**PowerShell:**
 ```powershell
-py -m venv venv
-.\venv\Scripts\Activate.ps1
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
 # se bloquear: Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+# verificar:
+Get-Command python | Format-List Source  # ...\nif-pt\.venv\Scripts\python.exe
 ```
 
-**cmd.exe:**
-```cmd
-python -m venv venv
-venv\Scripts\activate.bat
+**Git Bash (MINGW64):**
+
+```bash
+python -m venv .venv
+source .venv/Scripts/activate
+which python  # .../nif-pt/.venv/Scripts/python.exe
 ```
 
-> **Erro comum:** `source venv/bin/activate` é Linux; em Windows é `venv/Scripts/activate`. `Activate.ps1` só funciona em PowerShell.
+> `venv/Scripts/activate` é Windows; `venv/bin/activate` só Linux. `Activate.ps1` só PS.
 
 ### 4.3 Instalar dependências
 
 ```bash
 pip install -r requirements.txt
-# requirements.txt contém:
 # requests>=2.31.0
 # pyyaml>=6.0.1
 # python-dotenv>=1.0.0
@@ -206,6 +229,8 @@ pip install -r requirements.txt
 
 ```bash
 python -c "from config.config import get_config; print(get_config('consulta_nif').keys())"
+python -c "import consulta_nif; help(consulta_nif.validar_nif)"
+python -c "from utils.error_handler import tratar_erro; help(tratar_erro)"
 python consulta_nif.py 509442013  # requer NIF-PT-KEY
 ```
 
@@ -213,21 +238,26 @@ python consulta_nif.py 509442013  # requer NIF-PT-KEY
 
 ## 5. Configuração
 
-### 5.1 `config/config.yaml` (27L)
+### 5.1 `config/config.yaml` (37L)
 
 ```yaml
 default:
-  retry_count: 0        # 🚧 reservado, não implementado
-  timeout: 1000         # ⚠️ em segundos para requests (ver 5.4)
-  tempo_de_espera: 60   # 🚧 reservado
-
+  retry_count: 1
+  timeout: 10
+  tempo_de_espera: 60
+  tempo_espera_minuto: 60
+  tempo_espera_hora: 3600
+  max_tentativas_global: 5
+  max_tentativas_minuto: 3
+  max_tentativas_hora: 2
+  max_tentativas_dia: 0
+  max_tentativas_mes: 0
+  max_tentativas_paid: 0
 consulta_nif:
   api_base: "http://www.nif.pt"
-
 importar_nif_sqlite:
   db_path: "data/nif_pt.db"
   tabela: "nif_pt"
-
 importar_nif:
   sql_server: "kiwa-pt-operations.database.windows.net"
   sql_database: "kiwa-pt-operations"
@@ -238,40 +268,34 @@ importar_nif:
 
 | Chave | Onde usada | Descrição |
 |-------|------------|-----------|
-| `default.timeout` | `consulta_nif.py:23` `requests.get(timeout=TIMEOUT)` | Timeout HTTP em **segundos** |
-| `default.retry_count` | — | Reservado |
-| `consulta_nif.api_base` | `consulta_nif.py:21` | Base URL da API |
-| `importar_nif_sqlite.db_path` | `importar_nif_sqlite.py:24` | Caminho SQLite (relativo à raiz) |
-| `importar_nif.sql_*` | `importar_nif.py:25` | Conexão Azure SQL |
+| `timeout` | `consulta_nif.py:28` `requests.get(timeout=10)` | segundos (10s, não 1000) |
+| `tempo_de_espera` | `consulta_nif.py:129` | retry rede/Timeout genérico 60s |
+| `tempo_espera_minuto/hora` | `utils/error_handler.py:215` `get_tempo_espera()` | 60s / 3600s por janela rate-limit |
+| `max_tentativas_global` | `consulta_nif.py:35` `MAX_TENTATIVAS_GLOBAL` | limite total (5) |
+| `max_tentativas_minuto/hora/dia/mes` | `utils/error_handler.py:226` | 3 / 2 / 0 / 0 (0=abort) |
+| `api_base` | `consulta_nif.py:26` | `http://www.nif.pt` |
+| `db_path` | `importar_nif_sqlite.py:29` | `data/nif_pt.db` |
 
 ### 5.2 `config/.env` (+ `.env.example`)
 
 ```env
-# NIF-PT — obter em http://www.nif.pt/contactos/api/
+# NIF-PT — http://www.nif.pt/contactos/api/
 NIF-PT-KEY=coloque_aqui
 
-# Azure SQL — portal.azure.com → SQL → Connection strings
+# Azure SQL — portal.azure.com → Connection strings
 AZURE_USER=seu_user
 AZURE_PALAVRA_CHAVE=sua_password
 
 # Opcional futuro
-# API_TOKEN=se_tiver_api_propria
+# API_TOKEN=...
 ```
 
-* Criar com `cp config/.env.example config/.env` e editar.
-* **Nunca** commitar `.env` (`.gitignore:7`).
-* Nome **exato** `NIF-PT-KEY` com hífen — `NIF_PT_KEY` não é lido (`config.py:38` `os.getenv("NIF-PT-KEY")`).
+* `Copy-Item config\.env.example config\.env` e editar — **nunca** commitar (`.gitignore`).
+* Nome **exato** `NIF-PT-KEY` com hífen — `NIF_PT_KEY` não é lido (`config.py:55`).
 
 ### 5.3 Precedência
 
-`default` < bloco do script < `.env`. `config.py:29` faz `config.update(script_config)` (shallow merge).
-
-### 5.4 Problemas conhecidos de configuração
-
-| Chave | Problema | Recomendação |
-|-------|----------|--------------|
-| `timeout:1000` | 1000s ≈ 16min; intenção provável era 1000ms = 1s | Mudar para `timeout: 10` ou `15` e documentar unidade **segundos** |
-| `retry_count:0` / `tempo_de_espera:60` | Lidos mas nunca usados (`consulta_nif.py` não faz retry) | Implementar `for attempt in range(retry_count+1): try: requests... except Timeout: sleep(tempo_de_espera)` ou marcar como 🚧 |
+`default` < bloco do script < `.env` — `config.py:45` `config.update(script_config)` (shallow merge).
 
 ---
 
@@ -279,55 +303,58 @@ AZURE_PALAVRA_CHAVE=sua_password
 
 ### 6.1 Modo 1 — Só consulta (sem gravar)
 
-```bash
+```powershell
 python consulta_nif.py 509442013
 ```
 
-* Valida formato (`consulta_nif.py:98` `nif.isdigit()`) e dígito de controlo (`validar_nif():26`).
-* Se formato básico inválido → `{"erro":"NIF deve conter apenas dígitos"}` + `exit 1` sem request.
-* Se `NIF-PT-KEY` em falta → `{"erro":"NIF-PT-KEY não encontrada no .env"}` + `exit 1` (`consulta_nif.py:40`).
-* Caso contrário faz `GET http://www.nif.pt/?json=1&q=<NIF>&key=<KEY>` e imprime JSON em `stdout`.
+* Valida `isdigit` + `validar_nif()` Mod-11 (`consulta_nif.py:48`) — log `WARN` se falha mas **não bloqueia** request.
+* Se `NIF-PT-KEY` falta → `{"erro":"NIF-PT-KEY não encontrada"}` + `exit 1` (`consulta_nif.py:88`).
+* Senão `GET http://www.nif.pt/?json=1&q=<NIF>&key=<KEY>` com `timeout 10s` e loop `max_global+1` com `tratar_erro()`.
 
 ### 6.2 Modo 2 — SQLite local
 
-```bash
+```powershell
 python consulta_nif.py 509442013 | python importar_nif_sqlite.py
-# stderr: NIF 509442013 guardado em nif_pt.
+# stderr: <<nif-pt>> INFO - [sqlite] INSERT nif_pt nif=509442013 -> 1 row em 0.02s
+#         | Guardado em SQLite |
 ```
 
-* `importar_nif_sqlite.py:37` `get_db()` cria `data/nif_pt.db` e tabela se não existir (`CREATE TABLE IF NOT EXISTS nif_pt:27`), ativa `PRAGMA journal_mode=WAL`.
-* Insere `(nif, dados=JSON completo, data_consulta=datetime.now())`.
+* `get_db()` cria `data/nif_pt.db` + `nif_pt` (`CREATE TABLE IF NOT EXISTS`, `PRAGMA WAL`) e `nif_api_erros` via `init_error_table()`.
+* `INSERT (nif, dados=JSON completo, data_consulta=datetime.now())`.
 
 ### 6.3 Modo 3 — Azure SQL
 
-```bash
+```powershell
 python consulta_nif.py 509442013 | python importar_nif.py
-# stderr: NIF 509442013 inserido em stg_nunotome.nif_pt_stg.
+# stderr: [db] INSERT stg_nunotome.nif_pt_stg nif=509442013 -> 1 row
+#         | Inserido em Azure SQL |
 ```
 
-* Pré-requisitos: ODBC 18, `AZURE_USER`/`AZURE_PALAVRA_CHAVE` em `.env`, tabela criada via `sql/01_criar_tabelas.sql`.
-* `importar_nif.py:83` `mapear_registo()` normaliza 36 colunas; `INSERT` parametrizado (`?`) com `commit`/`rollback`.
+* Pré: ODBC 18, `AZURE_USER/PALAVRA_CHAVE`, tabelas criadas via `sql/01_criar_tabelas.sql` + `sql/02_criar_tabela_erros.sql`.
+* `mapear_registo()` 36 cols → `INSERT` parametrizado `?` com `commit/rollback`.
 
 ### 6.4 Modo 4 — Ambos em simultâneo
 
-**Bash (WSL/Git Bash):**
-```bash
-python consulta_nif.py 509442013 | tee >(python importar_nif_sqlite.py) | python importar_nif.py
-```
+**PowerShell (correção — `tee >( )` não existe):**
 
-**PowerShell (correção — `tee` com `>( )` não existe):**
 ```powershell
 $json = python consulta_nif.py 509442013
 $json | python importar_nif_sqlite.py
 $json | python importar_nif.py
-# ou com ficheiro temporário:
+# ou:
 python consulta_nif.py 509442013 | Tee-Object -FilePath temp.json | python importar_nif.py
 python importar_nif_sqlite.py < temp.json
 ```
 
-### 6.5 Modo 5 — Ficheiro intermédio
+**Bash (WSL/Git Bash):**
 
 ```bash
+python consulta_nif.py 509442013 | tee >(python importar_nif_sqlite.py) | python importar_nif.py
+```
+
+### 6.5 Modo 5 — Ficheiro intermédio
+
+```powershell
 python consulta_nif.py 509442013 > resultado.json
 python importar_nif_sqlite.py < resultado.json
 python importar_nif.py < resultado.json
@@ -336,14 +363,16 @@ python importar_nif.py < resultado.json
 ### 6.6 Batch (múltiplos NIFs)
 
 **PowerShell:**
+
 ```powershell
 Get-Content nifs.txt | ForEach-Object {
     python consulta_nif.py $_ | python importar_nif_sqlite.py
-    Start-Sleep -Seconds 1  # respeitar rate-limit
+    Start-Sleep -Seconds 1  # respeitar rate-limit minuto
 }
 ```
 
 **Bash:**
+
 ```bash
 while read nif; do
     python consulta_nif.py "$nif" | python importar_nif_sqlite.py
@@ -351,122 +380,103 @@ while read nif; do
 done < nifs.txt
 ```
 
+### 6.7 Help Python (v1.0.0)
+
+```powershell
+python -c "import consulta_nif; help(consulta_nif.validar_nif)"
+python -c "import consulta_nif; help(consulta_nif.consultar_nif)"
+python -c "from utils.error_handler import classificar_erro, tratar_erro; help(tratar_erro)"
+python -c "from config.config import get_config; help(get_config)"
+python -c "import importar_nif; help(importar_nif.mapear_registo)"
+python -m pydoc consulta_nif
+python -m pydoc utils.error_handler
+```
+
+Ver `docs/api/help.md` — transcrições verificadas.
+
 ---
 
 ## 7. Esquemas de Base de Dados
 
 ### 7.1 Visão comparativa
 
-| Aspeto | SQLite (`nif_pt`) | Azure SQL (`nif_pt` / `nif_pt_stg`) |
-|--------|-------------------|-------------------------------------|
-| Ficheiro | `data/nif_pt.db` (ignorado) | `kiwa-pt-operations.stg_nunotome.*` |
-| Estratégia | JSON bruto schemaless | 36 cols normalizadas |
-| PK | `id INTEGER AUTOINCREMENT` | `nif BIGINT PK` (`nif_pt`) / `id BIGINT IDENTITY` (`nif_pt_stg`) |
-| Histórico | Sim (sem unicidade `nif`) | `nif_pt` só último; `nif_pt_stg` com histórico + `processado` |
-| DDL | `importar_nif_sqlite.py:27` inline | `sql/01_criar_tabelas.sql:21` |
+| Aspeto | SQLite `nif_pt` | SQLite `nif_api_erros` | Azure `nif_pt` | Azure `nif_pt_stg` | Azure `nif_api_erros` |
+|--------|-----------------|------------------------|----------------|--------------------|-----------------------|
+| Ficheiro | `data/nif_pt.db` | `data/nif_pt.db` | `kiwa-pt-operations` | idem | idem |
+| Cols | 4 | 14 | 37 | 40 | 14 |
+| PK | `id AUTOINCREMENT` | `id AUTOINCREMENT` | `nif` | `id IDENTITY` | `id IDENTITY` |
+| Histórico | Sim | Sim | Não (ouro) | Sim (`processado`) | Sim (`resolvido`) |
+| DDL | `importar_nif_sqlite.py:32` | `utils/error_handler.py:46` | `sql/01_criar_tabelas.sql:21` | `sql/01_criar_tabelas.sql:93` | `sql/02_criar_tabela_erros.sql:20` |
+| Estratégia | JSON bruto | Auditoria | 36 cols norm. | Staging + merge | Auditoria |
 
-### 7.2 SQLite — `nif_pt` (4 colunas)
+### 7.2 SQLite — `nif_pt` (4 cols)
 
 ```sql
 CREATE TABLE IF NOT EXISTS nif_pt (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    nif             INTEGER NOT NULL,
-    dados           TEXT NOT NULL,          -- JSON completo do resultado
-    data_consulta   TEXT NOT NULL DEFAULT (datetime('now'))
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    nif           INTEGER NOT NULL,
+    dados         TEXT NOT NULL,          -- json.dumps(resultado, ensure_ascii=False)
+    data_consulta TEXT NOT NULL DEFAULT (datetime('now'))
 );
 ```
 
-| Coluna | Tipo | Descrição |
-|--------|------|-----------|
-| `id` | INTEGER PK | Auto-incremento WAL |
-| `nif` | INTEGER | NIF consultado |
-| `dados` | TEXT | `json.dumps(resultado, ensure_ascii=False)` |
-| `data_consulta` | TEXT | `YYYY-MM-DD HH:MM:SS` (`datetime.now()`) |
-
-### 7.3 Azure SQL — `stg_nunotome.nif_pt` (37 cols, PK `nif`)
+### 7.3 SQLite/Azure — `nif_api_erros` (14 cols)
 
 ```sql
-CREATE TABLE stg_nunotome.nif_pt (
-    nif                     BIGINT          NOT NULL,
-    nif_valido_formato      BIT             NULL,
-    data_consulta           DATETIME2       NOT NULL DEFAULT GETDATE(),
-    consulta_origem         NVARCHAR(50)    NULL DEFAULT 'nif.pt',
-    seo_url                 NVARCHAR(255)   NULL,
-    title                   NVARCHAR(500)   NULL,
-    alias                   NVARCHAR(500)   NULL,
-    status                  NVARCHAR(50)    NULL,
-    start_date              DATE            NULL,
-    activity                NVARCHAR(MAX)   NULL,
-    place_address           NVARCHAR(500)   NULL,
-    place_pc4               NVARCHAR(10)    NULL,
-    place_pc3               NVARCHAR(10)    NULL,
-    place_city              NVARCHAR(100)   NULL,
-    address                 NVARCHAR(500)   NULL,
-    pc4                     NVARCHAR(10)    NULL,
-    pc3                     NVARCHAR(10)    NULL,
-    city                    NVARCHAR(100)   NULL,
-    geo_region              NVARCHAR(100)   NULL,
-    geo_county              NVARCHAR(100)   NULL,
-    geo_parish              NVARCHAR(100)   NULL,
-    contacts_email          NVARCHAR(255)   NULL,
-    contacts_phone          NVARCHAR(50)    NULL,
-    contacts_website        NVARCHAR(255)   NULL,
-    contacts_fax            NVARCHAR(50)    NULL,
-    structure_nature        NVARCHAR(50)    NULL,
-    structure_capital       DECIMAL(18,2)   NULL,
-    structure_capital_currency NVARCHAR(10) NULL,
-    cae                     NVARCHAR(500)   NULL,
-    racius                  NVARCHAR(500)   NULL,
-    portugalio              NVARCHAR(500)   NULL,
-    creditos_used           NVARCHAR(50)    NULL,
-    creditos_left_month     INT             NULL,
-    creditos_left_day       INT             NULL,
-    creditos_left_hour      INT             NULL,
-    creditos_left_minute    INT             NULL,
-    creditos_left_paid      INT             NULL,
-    CONSTRAINT pk_nif_pt PRIMARY KEY CLUSTERED (nif)
+-- SQLite (utils/error_handler.py:46)
+CREATE TABLE IF NOT EXISTS nif_api_erros (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    nif           INTEGER,
+    data_erro     TEXT NOT NULL DEFAULT (datetime('now')),
+    tipo_erro     TEXT NOT NULL,          -- rate_limit_minute/hour/day/month/paid/unknown
+    codigo_erro   TEXT,                   -- result da API
+    mensagem      TEXT,                   -- message da API
+    left_month    INTEGER, left_day INTEGER, left_hour INTEGER,
+    left_minute   INTEGER, left_paid INTEGER,
+    dados_json    TEXT NOT NULL,          -- JSON completo
+    acao          TEXT,                   -- retry_60s / abort_day / none
+    resolvido     INTEGER NOT NULL DEFAULT 0
 );
+-- Índices: idx_nif_api_erros_nif, idx_nif_api_erros_tipo
 ```
-
-### 7.4 Azure SQL — `stg_nunotome.nif_pt_stg` (40 cols, PK `id`)
-
-Igual ao `nif_pt` + 3 colunas de controlo staging:
 
 ```sql
-CREATE TABLE stg_nunotome.nif_pt_stg (
-    id                      BIGINT          IDENTITY(1,1) NOT NULL,
-    -- ... mesmos 37 cols do nif_pt ...
-    data_staging            DATETIME2       NOT NULL DEFAULT GETDATE(),
-    processado              BIT             NOT NULL DEFAULT 0,
-    CONSTRAINT pk_nif_pt_stg PRIMARY KEY CLUSTERED (id)
+-- Azure SQL (sql/02_criar_tabela_erros.sql:20)
+CREATE TABLE stg_nunotome.nif_api_erros (
+    id            BIGINT IDENTITY(1,1) NOT NULL,
+    nif           BIGINT NULL,
+    data_erro     DATETIME2 NOT NULL DEFAULT GETDATE(),
+    tipo_erro     NVARCHAR(50) NOT NULL,
+    codigo_erro   NVARCHAR(50) NULL,
+    mensagem      NVARCHAR(500) NULL,
+    left_month    INT NULL, left_day INT NULL, left_hour INT NULL,
+    left_minute   INT NULL, left_paid INT NULL,
+    dados_json    NVARCHAR(MAX) NOT NULL,
+    acao          NVARCHAR(50) NULL,
+    resolvido     BIT NOT NULL DEFAULT 0,
+    CONSTRAINT pk_nif_api_erros PRIMARY KEY CLUSTERED (id)
 );
+-- Índices: ix_nif_api_erros_nif, _tipo, _data
 ```
 
-Diferença: `nif_pt_stg` tem `id`, `data_staging`, `processado`; `nif_pt` não. `importar_nif.py:132` `colunas_tabela()` lista 36 cols (sem `id/data_consulta/data_staging/processado` que são `DEFAULT`).
+### 7.4 Azure SQL — `nif_pt` (37 cols, PK `nif`) e `nif_pt_stg` (40 cols, PK `id`)
+
+37 cols = `nif`, `nif_valido_formato`, `data_consulta`, `consulta_origem`, `seo_url`, `title`, `alias`, `status`, `start_date`, `activity`, `place_address/pc4/pc3/city`, `address/pc4/pc3/city`, `geo_region/county/parish`, `contacts_email/phone/website/fax`, `structure_nature/capital/capital_currency`, `cae`, `racius`, `portugalio`, `creditos_used`, `creditos_left_month/day/hour/minute/paid`.
+
+`nif_pt_stg` = 37 + `id`, `data_staging`, `processado` (40). `colunas_tabela()` (`importar_nif.py:169`) lista 36 (sem `id/data_*` com `DEFAULT`).
+
+Ver `docs/database/schema.md` para catálogo completo + ER Mermaid.
 
 ### 7.5 Criação das tabelas
 
-```bash
+```powershell
 # SSMS / Azure Data Studio / sqlcmd
-# Executar sql/01_criar_tabelas.sql — cria schema stg_nunotome se não existir
+sqlcmd -S kiwa-pt-operations.database.windows.net -d kiwa-pt-operations -i sql/01_criar_tabelas.sql
+sqlcmd -S kiwa-pt-operations.database.windows.net -d kiwa-pt-operations -i sql/02_criar_tabela_erros.sql
+# SQLite cria nif_api_erros automaticamente no próximo consulta_nif.py (init_error_table)
 ```
 
-> **Atenção:** o DDL faz `IF OBJECT_ID(...) IS NOT NULL DROP TABLE` — **destrutivo**. Em produção usar `IF NOT EXISTS CREATE` ou migrations. Recomenda-se `CREATE INDEX ON nif_pt_stg(nif, processado) WHERE processado=0`.
-
-### 7.6 Estratégia staging → prod
-
-`importar_nif.py` insere sempre em `nif_pt_stg` (`importar_nif.py:9` docstring: “O tratamento e migração para `nif_pt` é feito posteriormente noutro processo”). Um `MERGE`/`procedure` futuro (`usp_merge_nif_pt`) deve fazer `INSERT/UPDATE` em `nif_pt` onde `processado=0`.
-
-```sql
--- Exemplo futuro (não incluído no repo):
-MERGE stg_nunotome.nif_pt AS target
-USING (SELECT * FROM stg_nunotome.nif_pt_stg WHERE processado=0) AS source
-ON target.nif = source.nif
-WHEN MATCHED THEN UPDATE SET ...
-WHEN NOT MATCHED THEN INSERT ...
-```
-
-Ver [docs/database/schema.md](docs/database/schema.md) para ER completo.
+> `01_criar_tabelas.sql` faz `IF OBJECT_ID(...) IS NOT NULL DROP TABLE` — destrutivo. Em prod usar `IF NOT EXISTS CREATE`. Recomenda `CREATE INDEX ON nif_pt_stg(nif, processado) WHERE processado=0`.
 
 ---
 
@@ -474,9 +484,9 @@ Ver [docs/database/schema.md](docs/database/schema.md) para ER completo.
 
 | Comando | Argumentos | stdin | stdout | stderr | Exit |
 |---------|------------|-------|--------|--------|------|
-| `consulta_nif.py` | `<NIF>` (9 dígitos) | — | JSON | mensagens erro | `0` ok, `1` erro |
-| `importar_nif_sqlite.py` | — | JSON | — | `NIF x guardado` | `0`/`1` |
-| `importar_nif.py` | — | JSON | — | `NIF x inserido` | `0`/`1` |
+| `consulta_nif.py` | `<NIF>` 9 dígitos | — | JSON | `<<nif-pt>>` BOX/TAG/TIMING | `0` ok, `1` erro |
+| `importar_nif_sqlite.py` | — | JSON | — | `BOX Guardado em SQLite` | `0/1` |
+| `importar_nif.py` | — | JSON | — | `BOX Inserido em Azure SQL` | `0/1` |
 
 ### 8.1 `consulta_nif.py`
 
@@ -485,25 +495,22 @@ Uso: python consulta_nif.py <NIF>
 Exemplo: python consulta_nif.py 509442013
 ```
 
-* Valida `nif.isdigit()` (`consulta_nif.py:98`) antes de rede.
-* Validação Mod-11 completa em `validar_nif():26` afeta campo `valido` mas **não bloqueia request** (ver §13.6).
-* `TIMEOUT` de `config.yaml` (segundos) passado a `requests.get(timeout=TIMEOUT)`.
+* `TIMEOUT 10s` + `max_tentativas_global 5` + `retry 60s/3600s` via `error_handler`.
+* `help(consulta_nif.validar_nif)` / `help(consulta_nif.consultar_nif)` para docstrings PEP 257.
 
-### 8.2 `importar_nif_sqlite.py` / `importar_nif.py`
+### 8.2 Importadores
 
 ```
 Uso: python consulta_nif.py 509442013 | python importar_nif_sqlite.py
      python importar_nif_sqlite.py < ficheiro.json
+     python consulta_nif.py 509442013 | python importar_nif.py
 ```
-
-* Ambos: `sys.stdin.read()` → `json.loads` → valida `resultado.erro` e `nif` → `INSERT`.
-* `importar_nif.py:179` exige `AZURE_USER`/`AZURE_PALAVRA_CHAVE` em `.env`.
 
 ---
 
 ## 9. Referência de Dados e JSON
 
-### 9.1 Exemplo JSON sucesso (resposta real `509442013`, 2026-09-10)
+### 9.1 Exemplo JSON sucesso (509442013, 2026-09-10)
 
 ```json
 {
@@ -520,38 +527,40 @@ Uso: python consulta_nif.py 509442013 | python importar_nif_sqlite.py
     "start_date": "2010-05-18",
     "activity": "<p>Desenvolvimento de software...</p>",
     "address": "Rua de Santa Catarina, Nº 1232",
-    "pc4": "4000",
-    "pc3": "457",
-    "city": "Porto",
-    "place": {
-      "address": "Rua de Santa Catarina, Nº 1232",
-      "pc4": "4000", "pc3": "457", "city": "Porto"
-    },
-    "geo": {
-      "region": "Porto", "county": "Porto", "parish": "Cedofeita"
-    },
-    "contacts": {
-      "email": "info@nex.pt",
-      "phone": "220 198 228",
-      "website": "www.nex.pt",
-      "fax": "224 905 459"
-    },
-    "structure": {
-      "nature": "UNI", "capital": "248000.00", "capital_currency": "EUR"
-    },
+    "pc4": "4000", "pc3": "457", "city": "Porto",
+    "place": { "address": "Rua ...", "pc4": "4000", "pc3": "457", "city": "Porto" },
+    "geo": { "region": "Porto", "county": "Porto", "parish": "Cedofeita" },
+    "contacts": { "email": "info@nex.pt", "phone": "220 198 228", "website": "www.nex.pt", "fax": "224 905 459" },
+    "structure": { "nature": "UNI", "capital": "248000.00", "capital_currency": "EUR" },
     "cae": ["62010", "63120", "62020", "46510"],
     "racius": "https://www.racius.com/nexperience-lda/",
     "portugalio": null
   },
   "nif_valido_formato": true,
-  "creditos": {
-    "used": "free",
-    "left": []
-  }
+  "creditos": { "used": "free", "left": [] }
 }
 ```
 
-### 9.2 Exemplo JSON erro
+### 9.2 Exemplo JSON erro rate-limit (classificado v1.0.0)
+
+```json
+{
+  "nif": "509442013",
+  "valido": true,
+  "fonte": "nif.pt",
+  "erro": "Limit per minute exceeded",
+  "dados": {
+    "result": "error",
+    "message": "Limit per minute exceeded",
+    "credits": { "left": { "minute": 0, "hour": 9, "day": 99, "month": 999 } }
+  },
+  "tipo_erro": "rate_limit_minute"
+}
+```
+
+Persistido em `nif_api_erros` com `acao=retry_60s` e retry automático 60s (max 3).
+
+### 9.3 Exemplo JSON `No records`
 
 ```json
 {
@@ -559,135 +568,135 @@ Uso: python consulta_nif.py 509442013 | python importar_nif_sqlite.py
   "valido": false,
   "fonte": "nif.pt",
   "erro": "No records found",
-  "dados": {
-    "result": "No records found",
-    "nif_validation": false
-  }
+  "dados": { "result": "No records found", "nif_validation": false },
+  "tipo_erro": "generic_error"
 }
 ```
 
-### 9.3 Mapeamento `mapear_registo()` → SQL
+### 9.4 Mapeamento `mapear_registo()` → SQL
 
-`importar_nif.py:83` desembrulha `dados.{place,geo,contacts,structure}` + `creditos`:
+`importar_nif.py:103` desembrulha `dados.{place,geo,contacts,structure}` + `creditos`:
 
-| Campo API | Coluna SQL | Parser |
-|-----------|------------|--------|
+| API | SQL | Parser |
+|-----|-----|--------|
 | `dados.seo_url` | `seo_url` | direto |
-| `dados.title` | `title` | direto |
-| `dados.status` | `status` | direto |
-| `dados.start_date` | `start_date` | `parse_date():54` `fromisoformat` |
-| `dados.cae` (lista) | `cae` | `extrair_cae():45` `",".join` |
-| `dados.contacts.email` | `contacts_email` | direto |
-| `dados.structure.capital` | `structure_capital` | `parse_capital():65` `","→"."` float |
-| `creditos.used` | `creditos_used` | direto |
-| `creditos.left.month` | `creditos_left_month` | `parse_int():74` |
+| `dados.cae` lista | `cae` | `extrair_cae() -> ",".join` |
+| `dados.start_date` | `start_date` | `parse_date() -> date` |
+| `structure.capital` | `structure_capital` | `parse_capital() ","→"."` |
+| `creditos.left.month` | `creditos_left_month` | `parse_int()` |
 
-Lista completa em `colunas_tabela():132` (36 nomes).
+`colunas_tabela()` 36 nomes — `parse_*` devolve `None` → `NULL`.
 
-### 9.4 Caso limite `creditos.left`
+### 9.5 Caso `creditos.left`
 
-* **Pago:** `left: {"month":999, "day":99, "hour":9, "minute":0, "paid":0}` → `parse_int` extrai valores.
-* **Gratuito (real 2026-09-10):** `left: []` (lista vazia) → `importar_nif.py:90` faz `creditos.get("left") or {}` → `{}` → todas as colunas `creditos_left_*` ficam `NULL`. **Não crasha**, mas `MANUAL.md` anterior exemplificava sempre `dict` — agora documentado.
+* **Pago:** `{"month":999,"day":99,"hour":9,"minute":0,"paid":0}` → `parse_int`.
+* **Free (real 2026-09-10):** `[]` → `importar_nif.py:116` `or {}` → `NULL` em SQL (não crasha).
 
-### 9.5 Validação Mod-11
-
-`consulta_nif.py:26`:
+### 9.6 Validação Mod-11
 
 ```python
-def validar_nif(nif: str) -> bool:
-    if not nif.isdigit() or len(nif) != 9: return False
-    total = sum(int(d) * (9 - i) for i, d in enumerate(nif[:8]))
-    resto = total % 11
-    digito_controlo = 0 if resto in (0, 1) else 11 - resto
-    return digito_controlo == int(nif[8])
+total = sum(int(d) * (9 - i) for i, d in enumerate(nif[:8]))
+resto = total % 11
+digito = 0 if resto in (0, 1) else 11 - resto
+return digito == int(nif[8])
 ```
 
-Fórmula AT: `Σ d[i]*(9-i) %11 → 0 se resto 0/1 senão 11-resto`.
+`help(consulta_nif.validar_nif)` para docstring completa + exemplos.
 
 ---
 
 ## 10. Códigos de Erro e Saída
 
-| Campo `erro` | `valido` | `exit` | Significado | Ação |
-|--------------|----------|--------|-------------|------|
-| `null` | `true` | `0` | Sucesso | — |
-| `Uso: python consulta_nif.py <NIF>` | — | `1` | Sem argumento | Passar NIF |
-| `NIF deve conter apenas dígitos` | — | `1` | `nif.isdigit()==False` | Corrigir input |
-| `NIF-PT-KEY não encontrada no .env` | `validar_nif(nif)` | `1` | Chave em falta | Criar `config/.env` |
-| `Timeout na consulta à API nif.pt` | `validar_nif(nif)` | `1` | `requests.Timeout` | Aumentar `timeout` ou retry |
-| `Erro de rede: ...` | `validar_nif(nif)` | `1` | `RequestException` | Verificar rede/DNS |
-| `Resposta inválida (não JSON)` | `validar_nif(nif)` | `1` | `JSONDecodeError` | Reportar à API |
-| `No records found` / `error` | `validar_nif(nif)` | `1` | `result != "success"` | NIF sem registo público |
-| `ERRO: Nenhum JSON recebido no stdin.` | — | `1` | `stdin` vazio | Verificar pipe |
-| `ERRO: AZURE_USER ... não definidos` | — | `1` | `.env` sem Azure | Preencher `.env` |
-| `ERRO: Falha na ligação à BD` | — | `1` | `pyodbc.Error` | Ver driver/firewall |
+| `erro` | `tipo_erro` | `exit` | Significado | Ação `error_handler` | Retry |
+|--------|-------------|--------|-------------|----------------------|-------|
+| `null` | — | `0` | Sucesso | — | — |
+| `Uso: ... <NIF>` | — | `1` | Sem argv | — | — |
+| `NIF deve conter apenas dígitos` | — | `1` | `isdigit` fail | — | — |
+| `NIF-PT-KEY não encontrada` | — | `1` | sem chave | — | — |
+| `Timeout na consulta` | — | `1` | `requests.Timeout` | — | `sleep 60s` se `<max_global` |
+| `Erro de rede: ...` | — | `1` | `RequestException` | — | idem |
+| `Resposta inválida (não JSON)` | — | `1` | `JSONDecodeError` | — | — |
+| `Limit per minute` | `rate_limit_minute` | `1` | quota minuto | `retry_60s` | 60s, max 3 + global 5 |
+| `Limit per hour` | `rate_limit_hour` | `1` | quota hora | `retry_3600s` | 3600s, max 2 |
+| `Limit per day` | `rate_limit_day` | `1` | quota dia | `abort_day` BOX fatal | 0 (abort) |
+| `Limit per month` | `rate_limit_month` | `1` | quota mês | `abort_month` BOX fatal | 0 |
+| `Limit per ... paid` | `rate_limit_paid` | `1` | sem créditos pagos | `abort_paid` | 0 |
+| `No records found` / `error` | `generic_error` | `1` | sem registo público | `none` auditoria | 0 |
+| `Nenhum JSON no stdin` | — | `1` | pipe vazio | — | — |
 
-Importadores propagam `resultado.erro` — se `consulta_nif.py` falhou, `importar_*.py` também falha sem inserir.
+Importadores propagam `resultado.erro` — se `consulta_nif` falhou, não inserem. `tipo_erro` só em erros classificados.
 
 ---
 
 ## 11. Logging
 
-### 11.1 Estado atual
+### 11.1 Configuração v1.0.0
 
-`Logging/logging_template.py:1` (579L) é **template avançado não integrado**. Nenhum script faz `import logging` ou `setup_logging()`; erros vão para `stderr` via `print(..., file=sys.stderr)`.
+`Logging/logging_orchestrator.py` (580L) — **integrado** em todos os scripts (`setup_logging()`):
 
-### 11.2 Funcionalidades do template
+* `LOG_LEVEL_GLOBAL/FILE/CONSOLE = INFO` · `FILE_ULTRA_DEBUG/CONSOLE_ULTRA_DEBUG = True`.
+* `LOG_FOLDER='log_files'`, `LOG_OUTPUT_FILE='log_files/nif_pt.log'`, prefixo `<<nif-pt>>`.
+* `LOG_FORMAT_FILE='<<nif-pt>> %(asctime)s - %(name)s - %(levelname)s - %(message)s'` + ultra-debug `%(filename)s - %(funcName)s - %(lineno)d` em `DEBUG`.
+* `RotatingFileHandler` 10 MB / 5000 recs / 10 backups (`logging_orchestrator.py:64`).
 
-* Níveis: `LOG_LEVEL_GLOBAL=INFO`, `LOG_LEVEL_FILE=INFO`, `LOG_LEVEL_CONSOLE=INFO`.
-* Saída: `LOG_FOLDER='log_files'`, `LOG_OUTPUT_FILE='log_files/general_app.log'`, prefixo `<<eqs>>` (legado, deve ser `<<nif-pt>>`).
-* Formatos: `LOG_FORMAT_FILE/CONSOLE` + ultra-debug `%(filename)s - %(funcName)s - %(lineno)d`.
-* Rotação: `RotatingFileHandler` custom com `LOG_MAX_BYTES=10485760` (10 MB), `LOG_MAX_RECORDS=5000`, `LOG_MAX_BACKUP=10`.
-* Livro de estilo (9 estilos): `BANNER_APP_START/END [=,49]`, `BANNER_SECTION [-,49]`, `BANNER_FUNCTION [~,49,DEBUG]`, `TAG [tag]`, `SEPARATOR`, `BOX`, `TIMING_APP/SECTION/FUNCTION` (`time.perf_counter()`, `%.2fs`).
+### 11.2 Livro de estilo R1–R9
 
-Ver [docs/guides/logging.md](docs/guides/logging.md) para integração.
+| # | Estilo | Char | Width | Nível | Uso |
+|---|--------|------|-------|-------|-----|
+| 1 | `BANNER_APP_START/END` | `=` | 49 | INFO | `nif-pt consulta_nif a iniciar/finalizado` |
+| 3 | `BANNER_SECTION` | `-` | 49 | INFO | `Inserir staging` |
+| 5 | `BANNER_FUNCTION` | `~` | 49 | DEBUG | `validar_nif()` `consultar_nif()` `mapear_registo()` |
+| 6 | `TAG` | `[tag]` | — | herda | `[api][valid][cfg][db][sqlite][io][map][erro][rate-limit][cli]` |
+| 7 | `SEPARATOR` | `-` | 49 | DEBUG | `---------------------------------------------------` |
+| 8 | `BOX` | `-\|` | 49 | INFO | `| NIF : 509442013 |` `| Consulta com sucesso |` |
+| 9 | `TIMING` | `%.2fs` | — | INFO/DEBUG | `Aplicação concluída em 0.92s` `validar_nif -> 0.00s` |
 
-### 11.3 Como ativar (roadmap `v0.3`)
+Regras: `R1 WIDTH=49 ≤79`, `R4 [tag] lowercase`, `R6 f"{' title ':=^49}"`, `R9 %.2fs` via `time.perf_counter()`.
 
-```python
-from Logging.logging_template import setup_logging
-logger = setup_logging()
-logger.info("=" * 49)
-logger.info(f"{' nif-pt a iniciar ':=^49}")
-logger.info("=" * 49)
+### 11.3 Exemplo de saída
+
+```
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ===================================================
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ========= nif-pt consulta_nif a iniciar =========
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ===================================================
+<<nif-pt>> 2026-09-10 02:15:32 - consulta_nif - INFO - [api] GET http://www.nif.pt?q=509442013 key=***XXXX timeout=10s
+<<nif-pt>> 2026-09-10 02:15:32 - consulta_nif - WARNING - [rate-limit] Limite por minuto nif=509442013 left_minute=0 — espera 60s retry tipo 1/3 global 1/5
+<<nif-pt>> 2026-09-10 02:15:32 - consulta_nif - INFO - [api] NIF 509442013 válido=True credits used=free left=[] (0.85s)
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ---------------------------------------------------
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - | Consulta com sucesso                          |
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - | NIF         : 509442013                    |
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ---------------------------------------------------
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - Aplicação concluída em 0.92s
 ```
 
-Trocar `LOG_OUTPUT_PREFIX='<<eqs>>'` → `'<<nif-pt>>'` e criar `log_files/`.
+Ver `docs/guides/logging.md` + `docs/technical.md §11`.
 
 ---
 
 ## 12. Exemplos Práticos (PowerShell & Bash)
 
-Cada cenário em **duas colunas**: PowerShell 5.1 e Bash (WSL/Git Bash).
-
-### 12.1 Consultar e guardar em SQLite
+### 12.1 Consultar + SQLite
 
 | PowerShell | Bash |
 |------------|------|
 | `python consulta_nif.py 509442013 \| python importar_nif_sqlite.py` | idem |
 
-### 12.2 Consultar e guardar em Azure SQL
+### 12.2 Consultar + Azure
 
 | PowerShell | Bash |
 |------------|------|
 | `python consulta_nif.py 509442013 \| python importar_nif.py` | idem |
 
-### 12.3 Consultar e guardar em ambos
+### 12.3 Ambos
 
 | PowerShell | Bash |
 |------------|------|
 | `$j = python consulta_nif.py 509442013`<br>`$j \| python importar_nif_sqlite.py`<br>`$j \| python importar_nif.py` | `python consulta_nif.py 509442013 \| tee >(python importar_nif_sqlite.py) \| python importar_nif.py` |
 
-### 12.4 Guardar JSON para ficheiro
-
-| PowerShell | Bash |
-|------------|------|
-| `python consulta_nif.py 509442013 > resultado.json` | idem |
-| `python importar_nif_sqlite.py < resultado.json` | idem |
-
-### 12.5 Batch de NIFs
+### 12.4 Batch
 
 **PowerShell:**
+
 ```powershell
 Get-Content nifs.txt | ForEach-Object {
     Write-Host "A consultar $_"
@@ -697,139 +706,102 @@ Get-Content nifs.txt | ForEach-Object {
 ```
 
 **Bash:**
+
 ```bash
-while read nif; do
-    echo "A consultar $nif"
-    python consulta_nif.py "$nif" | python importar_nif_sqlite.py
-    sleep 1
-done < nifs.txt
+while read nif; do echo "A consultar $nif"; python consulta_nif.py "$nif" | python importar_nif_sqlite.py; sleep 1; done < nifs.txt
 ```
 
-### 12.6 Consultar histórico SQLite
+### 12.5 Histórico SQLite
 
-```bash
-# PowerShell e Bash (sqlite3 precisa estar no PATH)
-python -c "
-import sqlite3, json
-conn = sqlite3.connect('data/nif_pt.db')
-for id, nif, dados, data in conn.execute('SELECT id, nif, dados, data_consulta FROM nif_pt ORDER BY data_consulta DESC LIMIT 5'):
-    j = json.loads(dados)
-    print(f'{id}: NIF {nif} — {j[\"dados\"][\"title\"]} — {data}')
-"
-
-# Via sqlite3 CLI
-sqlite3 data/nif_pt.db "SELECT id, nif, data_consulta FROM nif_pt;"
-sqlite3 data/nif_pt.db ".schema nif_pt"
+```powershell
+python -c "import sqlite3,json; conn=sqlite3.connect('data/nif_pt.db'); [print(f'{r[0]}: {r[1]} - {json.loads(r[2])[\"dados\"][\"title\"]}') for r in conn.execute('SELECT id,nif,dados FROM nif_pt ORDER BY data_consulta DESC LIMIT 5')]"
+sqlite3 data/nif_pt.db "SELECT id,nif,data_consulta FROM nif_pt;"
+sqlite3 data/nif_pt.db "SELECT tipo_erro,COUNT(*) FROM nif_api_erros GROUP BY tipo_erro;"
 ```
 
-### 12.7 Validar NIF sem gastar créditos
+### 12.6 Validar sem créditos
 
-```bash
+```powershell
 python -c "from consulta_nif import validar_nif; print(validar_nif('509442013'))"  # True
 python -c "from consulta_nif import validar_nif; print(validar_nif('123456789'))"  # False
+python -c "from utils.error_handler import classificar_erro; print(classificar_erro({'result':'error','message':'Limit per minute'}))"
 ```
 
 ---
 
 ## 13. Resolução de Problemas (Troubleshooting)
 
-### 13.1 "NIF-PT-KEY não encontrada no .env"
+### 13.1 `NIF-PT-KEY não encontrada`
 
-1. Verificar `config/.env` existe (não `config\.env` nem `.env` na raiz).
-2. Linha exata `NIF-PT-KEY=xxxxx` com hífen, sem espaços à volta de `=`.
+1. `Test-Path config\.env` + `Get-Content config\.env` → deve ter `NIF-PT-KEY=xxxxx` com hífen, sem espaços.
+2. `os.getenv("NIF-PT-KEY")` em `config.py:55` — `NIF_PT_KEY` não funciona.
 3. Solicitar chave em http://www.nif.pt/contactos/api/.
 
-### 13.2 "No records found"
+### 13.2 `Limit per minute/hour` — rate-limit com retry
 
-NIF válido mas sem registo público em `nif.pt`. Pode ser pessoa singular sem atividade ou NIF recente. Não é erro de código — `importar_*.py` não insere.
+* `utils/error_handler.py:426` aguarda `60s` (minuto, max 3) ou `3600s` (hora, max 2) com limite global 5. Log: `[rate-limit] Limite por minuto nif=... espera 60s retry tipo 1/3 global 1/5`.
+* Ver `SELECT * FROM nif_api_erros WHERE tipo_erro='rate_limit_minute' ORDER BY data_erro DESC` + `log_files/nif_pt.log`.
+* Se exceder `max_tentativas_*` → `abort_retry_esgotado` com `motivo=max_tipo/max_global`.
 
-### 13.3 "NIF deve conter apenas dígitos"
+### 13.3 `Limit per day/month` — quota fatal
 
-`consulta_nif.py:98` rejeita antes de rede. Verificar `nifs.txt` não tem espaços, traços ou `PT`.
+* `max_tentativas_dia/mes = 0` → `abort` imediato + BOX `Erro fatal - quota diária/mensal excedida` + `exit 1`.
+* Persistido com `acao=abort_day/month` — consultar `nif_api_erros` para auditoria.
 
-### 13.4 "database is locked" (SQLite)
+### 13.4 `No records found`
 
-`importar_nif_sqlite.py:40` já usa `PRAGMA journal_mode=WAL`. Se persistir: garantir só um processo escreve de cada vez; considerar `PRAGMA busy_timeout=5000`.
+NIF válido sem registo público — não é erro de código; `importar_*.py` não insere; `tipo_erro=generic_error`.
 
-### 13.5 Erro de ligação Azure SQL
+### 13.5 `database is locked` (SQLite)
 
-1. `Test-Path config/.env` e `AZURE_USER`/`AZURE_PALAVRA_CHAVE` preenchidos.
-2. IP whitelist no Portal Azure → SQL → Networking.
-3. `ODBC Driver 18 for SQL Server` instalado (`Get-OdbcDriver` em PowerShell).
-4. `Encrypt=yes;TrustServerCertificate=no;` em `importar_nif.py:34` — se erro SSL, verificar `TrustServerCertificate`.
+`importar_nif_sqlite.py:50` `PRAGMA journal_mode=WAL` já mitiga; se persistir: `PRAGMA busy_timeout=5000` ou serializar writes.
 
 ### 13.6 Validação Mod-11 não bloqueia request
 
-`validar_nif()` (`consulta_nif.py:26`) só afeta campo `valido`; `main():98` só valida `isdigit()`. NIF `123456789` (dígito errado) **ainda faz request** e gasta crédito. Para filtrar antes:
+`validar_nif()` só afeta `valido`; `main()` só valida `isdigit`. `123456789` (dígito errado) faz request e gasta crédito. Filtrar antes:
 
-```bash
-python -c "from consulta_nif import validar_nif; import sys; sys.exit(0 if validar_nif('123456789') else 1)" && python consulta_nif.py 123456789
-# ou no código: if not validar_nif(nif): print(...); sys.exit(1)
+```powershell
+python -c "from consulta_nif import validar_nif; import sys; sys.exit(0 if validar_nif('123456789') else 1)" -and python consulta_nif.py 123456789
 ```
 
-Correção futura: `if not validar_nif(nif): return {"erro":"NIF inválido (dígito controlo)"}` antes de `requests.get`.
+### 13.7 Azure SQL `pyodbc.Error`
 
-### 13.7 "`timeout:1000` demora 16 minutos"
+1. `Test-Path config\.env` + `AZURE_USER/PALAVRA_CHAVE`.
+2. `Get-OdbcDriver -Name "*Driver 18*"` — instalar ODBC 18 se falta.
+3. Whitelist IP no Portal Azure → SQL → Networking.
+4. `Encrypt=yes;TrustServerCertificate=no` (`importar_nif.py:47`) — se SSL erro, verificar cert.
 
-`config.yaml:3` `timeout:1000` são **segundos** (`requests` espera segundos). Mudar para `timeout: 10` ou `15`:
+### 13.8 `tee` não funciona em PowerShell
 
-```yaml
-default:
-  timeout: 10
-```
+`tee >( )` é Bash; em PS usar variável `$json` ou `Tee-Object`.
 
-### 13.8 "`tee` não funciona em PowerShell"
+### 13.9 `ModuleNotFoundError: yaml`
 
-`tee >( )` é Bash. Em PowerShell usar variável ou `Tee-Object` (ver §6.4).
-
-### 13.9 `ModuleNotFoundError: No module named 'yaml'`
-
-`requirements.txt` antigo tinha `yaml` (pacote placeholder). Atual:
-
-```bash
-pip uninstall yaml -y
-pip install pyyaml python-dotenv pyodbc
-# ou
-pip install -r requirements.txt  # v0.2.1+
-```
-
-### 13.10 `pyodbc` falha a instalar
-
-Requer *Build Tools* (Windows) ou `unixODBC` (Linux). Em Windows instalar via `pip install pyodbc` com *wheel* pré-compilado (Python 3.11 `pyodbc.cp311-win_amd64.pyd` incluído).
+`pip uninstall yaml -y; pip install pyyaml python-dotenv pyodbc` ou `pip install -r requirements.txt` (fix v1.0.0).
 
 ---
 
 ## 14. FAQ
 
-**1. A consulta tem custo?**
-Plano `free` limitado (`creditos.left`); `paid` ilimitado. Ver `creditos.used` no JSON.
+**1. Custo?** Free limitado (`credits.left: []`); paid com `left: {month/day/hour/minute/paid}`.
 
-**2. Quantos créditos tenho?**
-`creditos.left` é `dict` (`month/day/hour/minute/paid`) quando `paid`, `[]` quando `free` (§9.4). `importar_nif.py` mapeia para `creditos_left_*` (NULL se `[]`).
+**2. Créditos?** `creditos.left` dict se `paid`, `[]` se `free`; `importar_nif` → `NULL` se `[]`.
 
-**3. Diferença SQLite vs Azure SQL?**
-SQLite guarda JSON bruto (flexível, 4 cols); Azure normaliza 36 cols (analítico, 40 cols staging). ADR-001 em §2.4.
+**3. SQLite vs Azure?** SQLite JSON bruto (4 cols, WAL) flexível; Azure 36 cols + `nif_api_erros` 14 cols analítico.
 
-**4. Fórmula Mod-11?**
-`Σ d[i]*(9-i) %11 → 0 se resto 0/1 senão 11-resto` == `d[8]`. `consulta_nif.py:26`.
+**4. Mod-11?** `Σ d*(9-i)%11 → 0 se resto 0/1 senão 11-resto` == `d[8]` (`consulta_nif.py:48`, `help(validar_nif)`).
 
-**5. Posso consultar NIFs em lote?**
-Sim, ver §12.5. Respeitar `sleep 1` para não exceder rate-limit.
+**5. Batch?** Sim, `sleep 1` + retry automático `60s/3600s` já trata `rate_limit`.
 
-**6. `main.py` serve para quê?**
-Stub legado (7L). Será `cli.py` com `argparse` em `v0.3`.
+**6. `nif_api_erros`?** Auditoria de todos os erros; `SELECT tipo_erro, mensagem, left_minute, acao FROM nif_api_erros`.
 
-**7. Preciso de Azure SQL?**
-Não. `importar_nif_sqlite.py` funciona standalone.
+**7. `main.py`?** Stub `BANNER+BOX`; futuro `cli.py --nif --to {sqlite,azure,both}`.
 
-**8. O que é `stg_nunotome`?**
-Schema pessoal (`config.yaml:25`). Mudar para `stg` ou `dbo` se partilhar BD.
+**8. `stg_nunotome`?** Schema pessoal (`config.yaml:33`); mudar para `stg/dbo` se partilhar.
 
-**9. Como sei se NIF é válido sem consultar API?**
-`python -c "from consulta_nif import validar_nif; print(validar_nif('509442013'))"`
+**9. Help Python?** `help(consulta_nif.validar_nif)`, `help(utils.error_handler.tratar_erro)` (ver `docs/api/help.md`).
 
-**10. Onde vejo o histórico?**
-`SELECT * FROM nif_pt ORDER BY data_consulta DESC` (SQLite) ou `SELECT * FROM stg_nunotome.nif_pt_stg WHERE processado=0` (Azure).
+**10. Histórico?** `SELECT * FROM nif_pt ORDER BY data_consulta DESC` (SQLite) ou `stg_nunotome.nif_pt_stg WHERE processado=0` (Azure).
 
 ---
 
@@ -837,65 +809,41 @@ Schema pessoal (`config.yaml:25`). Mudar para `stg` ou `dbo` se partilhar BD.
 
 ### 15.1 Glossário
 
-Ver [docs/glossary.md](docs/glossary.md).
+Ver [docs/glossary.md](docs/glossary.md). Termos: NIF, Mod-11, CAE, WAL, ODBC, `stg`, `creditos.left`, `nif_valido_formato`, `get_config`, `RotatingFileHandler`, `BOX/TAG/TIMING`, `rate_limit_*`, ADR, C4.
 
-| Termo | Definição |
-|-------|-----------|
-| NIF | Número de Identificação Fiscal (9 dígitos, PT) |
-| Mod-11 | Algoritmo dígito de controlo AT |
-| CAE | Classificação Portuguesa de Atividades Económicas |
-| WAL | Write-Ahead Logging (SQLite) |
-| ODBC | Open Database Connectivity |
-| `stg` | Staging (área temporária) |
-| `creditos.left` | Créditos restantes da API `nif.pt` |
-
-### 15.2 Estrutura de ficheiros
+### 15.2 Estrutura de ficheiros (v1.0.0)
 
 ```
 nif-pt/
-├── consulta_nif.py            # 110L — consulta API nif.pt
-├── importar_nif.py            # 213L — 36 cols → Azure SQL
-├── importar_nif_sqlite.py     # 88L  — JSON bruto → SQLite
-├── main.py                    # 7L  — stub (será cli.py)
-├── config/
-│   ├── config.py              # 40L — get_config()
-│   ├── config.yaml            # 27L — default + 3 blocos
-│   ├── .env.example           # template commitado
-│   └── .env                   # segredos (NÃO versionar)
-├── sql/01_criar_tabelas.sql   # 157L — DDL nif_pt + nif_pt_stg
-├── Logging/logging_template.py# 579L — template rotação (não integrado)
-├── api/__init__.py            # vazio, reservado FastAPI
-├── models/__init__.py         # vazio, reservado Pydantic
-├── scrapers/__init__.py       # vazio, reservado fallback HTML
-├── utils/__init__.py          # vazio, reservado helpers
-├── docs/                      # documentação técnica
-│   ├── architecture/
-│   ├── database/
-│   ├── api/
-│   ├── guides/
-│   └── glossary.md
-├── data/nif_pt.db             # gerado, ignorado
-├── requirements.txt           # requests, pyyaml, python-dotenv, pyodbc
-├── README.md                  # porta de entrada
-├── CHANGELOG.md               # histórico versões
-├── CONTRIBUTING.md
-├── SECURITY.md
-└── MANUAL.md                  # este ficheiro
+├── consulta_nif.py               # 355L — validar + GET + retry per-tipo+global
+├── importar_nif.py               # 321L — 36 cols → Azure staging
+├── importar_nif_sqlite.py        # 152L — JSON → SQLite WAL
+├── utils/error_handler.py        # 612L — classificar + tratar + guardar + init
+├── Logging/logging_orchestrator.py # 580L — R1-R9, <<nif-pt>>, 10MB/5000/10
+├── main.py                       # 52L — stub
+├── config/config.py              # 70L — get_config() + ***
+├── config/config.yaml            # 37L — default 11 chaves + 3 blocos
+├── sql/01_criar_tabelas.sql      # 157L — nif_pt 37c + nif_pt_stg 40c
+├── sql/02_criar_tabela_erros.sql # 44L — nif_api_erros 14c
+├── docs/technical.md             # v1.0.0 — C4 + sequência + ER + ADRs
+├── docs/api/help.md              # help() verificado
+├── docs/architecture/            # C4 + diagramas Mermaid v1.0.0
+├── docs/database/schema.md       # ER 37/40/14 cols
+├── docs/api/nif-pt-api.md        # contrato nif.pt
+├── data/nif_pt.db                # WAL, ignorado
+├── log_files/nif_pt.log          # RotatingFileHandler, ignorado
+├── requirements.txt              # requests, pyyaml, dotenv, pyodbc
+├── README.md                     # porta de entrada v1.0.0
+├── CHANGELOG.md                  # v1.0.0
+└── MANUAL.md                     # este ficheiro
 ```
 
 ### 15.3 Changelog resumido
 
-Ver [CHANGELOG.md](CHANGELOG.md) completo.
+Ver [CHANGELOG.md](CHANGELOG.md) — `v1.0.0` promove `beta` com `error_handler` + `logging_orchestrator` + `max_tentativas_*`.
 
-### 15.4 Licença e contactos
+### 15.4 Referências
 
-* Repositório: https://github.com/nunoetome/nif-pt
-* Chave API: http://www.nif.pt/contactos/api/
-* Autor template logging: `Nuno Tomé` — https://github.com/nunoetome/my_python_starter_kit
-
-### 15.5 Referências
-
-* `nif.pt` API: `GET http://www.nif.pt/?json=1&q=<NIF>&key=<KEY>` (`consulta_nif.py:48`)
-* `config/config.py:17` `get_config()`
-* `sql/01_criar_tabelas.sql:21` DDL
-* [docs/architecture/diagrams.md](docs/architecture/diagrams.md) — todos os diagramas Mermaid
+* `nif.pt` API: `GET http://www.nif.pt/?json=1&q=<NIF>&key=<KEY>` (`consulta_nif.py:98`)
+* `config/config.py:30` `get_config()` · `utils/error_handler.py:346` `tratar_erro()` · `Logging/logging_orchestrator.py:226` `setup_logging()`
+* [docs/technical.md](docs/technical.md) · [docs/architecture/diagrams.md](docs/architecture/diagrams.md) · [docs/api/help.md](docs/api/help.md)

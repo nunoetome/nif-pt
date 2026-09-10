@@ -1,12 +1,55 @@
 #!/usr/bin/env python3
 """
-Consulta NIF.pt — Dado um NIF, recolhe toda a informação pública e devolve JSON.
+consulta_nif — Consulta de NIF português via API nif.pt.
 
-Uso:
-    python consulta_nif.py <NIF>
-    python consulta_nif.py 509442013
+Módulo principal de recolha. Valida o NIF com o algoritmo Mod-11 da AT,
+consulta ``http://www.nif.pt/?json=1&q=<NIF>&key=<KEY>`` via ``requests``,
+e devolve um dicionário normalizado sempre com as chaves
+``nif / valido / fonte / erro / dados / nif_valido_formato / creditos``.
 
-A configuração (API base, key) é lida do config.yaml e .env via config.py.
+Pipeline Unix
+-------------
+O módulo escreve **apenas JSON** em ``stdout`` (``json.dumps``) e todas
+as mensagens humanas vão para ``stderr`` via :mod:`Logging.logging_orchestrator`,
+permitindo ``| python importar_nif_sqlite.py`` sem quebrar o pipe.
+
+Exemplos
+--------
+>>> from consulta_nif import validar_nif
+>>> validar_nif("509442013")
+True
+>>> validar_nif("123456789")
+False
+>>> validar_nif("999999990")  # dígito de controlo inválido
+False
+
+CLI:
+    $ python consulta_nif.py 509442013
+    $ python consulta_nif.py 509442013 | python importar_nif_sqlite.py
+
+Configuração
+------------
+Lida via :func:`config.config.get_config` (``config/config.yaml`` +
+``config/.env``):
+
+* ``api_base`` — base URL (default ``http://www.nif.pt``)
+* ``NIF_PT_KEY`` / ``NIF-PT-KEY`` — chave da API (``.env`` com hífen)
+* ``timeout`` — segundos para ``requests.get`` (default ``10``)
+* ``retry_count`` / ``max_tentativas_*`` — limites de retry (ver :mod:`utils.error_handler`)
+* ``tempo_de_espera`` / ``tempo_espera_minuto`` / ``hora`` — esperas por janela rate-limit
+
+Logging
+-------
+Usa :func:`Logging.logging_orchestrator.setup_logging` com prefixo
+``<<nif-pt>>``, ``RotatingFileHandler`` (10 MB / 5000 recs / 10 backups),
+ficheiro ``log_files/nif_pt.log`` e estilos R1–R9 (BANNER ``= 49``, BOX, TAG
+``[api][valid][cfg]``, TIMING ``%.2fs`` com ``time.perf_counter``).
+
+Notas
+-----
+* ``NIF-PT-KEY`` com hífen é intencional — ``os.getenv("NIF-PT-KEY")``.
+* O campo ``tipo_erro`` só aparece em respostas de erro classificadas
+  por :func:`utils.error_handler.tratar_erro`.
 """
 
 import json
@@ -46,6 +89,42 @@ if TIMEOUT and TIMEOUT > 60:
 
 
 def validar_nif(nif: str) -> bool:
+    """Valida o NIF português pelo algoritmo Mod-11 da Autoridade Tributária.
+
+    Implementa a fórmula oficial da AT: para os 8 primeiros dígitos
+    ``d[0..7]`` calcula ``total = Σ d[i] * (9-i)``, ``resto = total % 11``,
+    ``digito = 0`` se ``resto in (0,1)`` senão ``11 - resto``. O NIF é válido
+    quando ``digito == d[8]`` (9.º dígito).
+
+    A função **não** consulta a API nem consome créditos; serve de filtro
+    local antes de :func:`consultar_nif`.
+
+    Args:
+        nif: String com 9 caracteres. Deve conter apenas dígitos ``0-9``;
+            espaços, hífens ou prefixo ``PT`` invalidam.
+
+    Returns:
+        ``True`` se o NIF tem 9 dígitos, não é ``000000000`` e o dígito de
+        controlo bate certo; ``False`` caso contrário.
+
+    Examples:
+        >>> validar_nif("509442013")
+        True
+        >>> validar_nif("501442013")  # exemplo genérico
+        False
+        >>> validar_nif("123")
+        False
+        >>> validar_nif("PT509442013")
+        False
+
+    See Also:
+        :func:`consultar_nif` — usa este validador para preencher o campo
+        ``valido`` / ``nif_valido_formato`` do JSON de saída.
+
+    Notas:
+        * ``000000000`` é rejeitado explicitamente (``nif_int == 0``).
+        * O logging usa TAG ``[valid]`` e TIMING ``%.2fs`` (R9).
+    """
     logger.debug(f"{' validar_nif() ':~^49}")
     t = time.perf_counter()
     if not nif.isdigit() or len(nif) != 9:
@@ -82,6 +161,68 @@ def validar_nif(nif: str) -> bool:
 
 
 def consultar_nif(nif: str) -> dict:
+    """Consulta a API ``nif.pt`` para o NIF dado e devolve dict normalizado.
+
+    Faz ``GET {API_BASE}/?json=1&q=<nif>&key=<NIF_PT_KEY>`` com
+    ``timeout=TIMEOUT`` e ``requests.get``. Em caso de ``result != "success"``
+    delega a classificação / persistência / decisão de retry a
+    :func:`utils.error_handler.tratar_erro` (rate-limit minuto/hora → retry
+    ``60s/3600s``, dia/mês/paid → abort, genérico → ``none``).
+
+    A função gere um *loop* global ``for tentativa_global in range(max_global+1)``
+    e um dicionário ``tentativas_por_tipo`` para respeitar os limites
+    ``max_tentativas_global`` / ``minuto`` / ``hora`` / ``dia`` / ``mes``
+    definidos em ``config/config.yaml``.
+
+    Args:
+        nif: NIF com 9 dígitos (já validado opcionalmente por
+            :func:`validar_nif`). Não precisa ser válido — a API é sempre
+            consultada se ``NIF-PT-KEY`` existir.
+
+    Returns:
+        Dicionário com chaves estáveis (sempre presentes):
+
+        * ``nif`` (``str``) — NIF consultado.
+        * ``valido`` (``bool``) — resultado de :func:`validar_nif`.
+        * ``fonte`` (``str | None``) — ``"nif.pt"`` ou ``None`` se sem chave.
+        * ``erro`` (``str | None``) — ``None`` em sucesso, mensagem caso contrário.
+        * ``dados`` (``dict | None``) — ``records[nif]`` em sucesso, payload
+          completo da API em erro, ``None`` em erro de rede/timeout.
+        * ``nif_valido_formato`` (``bool | None``) — ``data["nif_validation"]``.
+        * ``creditos`` (``dict | None``) — ``data["credits"]`` (``{"used","left"}``).
+        * ``tipo_erro`` (``str``) — só em erro classificado (ex.
+          ``"rate_limit_minute"``).
+
+        Em sucesso ``erro is None`` e ``valido is True``; em erro
+        ``erro`` contém ``message`` ou ``result`` da API.
+
+    Raises:
+        Não levanta exceções para o chamador — todos os
+        ``requests.exceptions.Timeout``, ``RequestException`` e
+        ``json.JSONDecodeError`` são capturados e convertidos em dict de erro.
+        Falhas no :mod:`utils.error_handler` fazem fallback para lógica
+        antiga sem quebrar o fluxo.
+
+    Examples:
+        >>> r = consultar_nif("509442013")  # doctest: +SKIP
+        >>> r["erro"] is None and r["valido"] is True
+        True
+        >>> r["dados"]["title"]  # doctest: +SKIP
+        'Nexperience, Unipessoal, Lda'
+        >>> consultar_nif("000000000")["erro"] is not None  # doctest: +SKIP
+        True
+
+    See Also:
+        :func:`validar_nif`, :func:`utils.error_handler.classificar_erro`,
+        :func:`utils.error_handler.tratar_erro`, :func:`utils.error_handler.guardar_erro`.
+
+    Notas:
+        * ``API_KEY`` mascarada no log como ``***XXXX``.
+        * ``records`` é ``dict`` com NIF como chave; usa fallback
+          ``records[list(records)[0]]`` quando a chave exata não existe.
+        * ``credits.left`` pode ser ``[]`` (free plan) em vez de ``dict``.
+        * Logging: TAG ``[api]`` + TIMING (R9) + BOX de resumo no :func:`main`.
+    """
     logger.debug(f"{' consultar_nif() ':~^49}")
     t_total = time.perf_counter()
 
@@ -269,6 +410,37 @@ def consultar_nif(nif: str) -> dict:
 
 
 def main():
+    """Ponto de entrada CLI — valida argv, garante tabela de erros e imprime JSON.
+
+    Fluxo:
+
+    1. ``setup_logging()`` + BANNER ``= 49`` (R1).
+    2. ``init_error_table()`` idempotente (ignora falhas).
+    3. Valida ``sys.argv[1]`` (``isdigit``) e loga ``validar_nif`` Mod-11
+       (aviso mas não bloqueia — o request é sempre tentado).
+    4. Chama :func:`consultar_nif` e faz ``print(json.dumps(..., indent=2,
+       ensure_ascii=False))`` em ``stdout``.
+    5. BOX de resumo (``- 49`` + ``| ... |``) e TIMING ``Aplicação concluída
+       em %.2fs``; ``sys.exit(1)`` se ``resultado["erro"]``.
+
+    Args:
+        Nenhum — lê ``sys.argv`` diretamente. Espera ``sys.argv[1]`` com
+        NIF de 9 dígitos.
+
+    Returns:
+        Não retorna — termina com ``sys.exit(0)`` em sucesso ou
+        ``sys.exit(1)`` em erro. ``stdout`` contém sempre JSON válido.
+
+    Examples:
+        >>> # $ python consulta_nif.py 509442013  (doctest: +SKIP)
+        >>> # {"nif": "509442013", "valido": true, "erro": null, ...}
+        >>> # $ python consulta_nif.py 999  (doctest: +SKIP)
+        >>> # {"erro": "NIF deve conter apenas dígitos"}
+
+    See Also:
+        :func:`validar_nif`, :func:`consultar_nif`,
+        :func:`utils.error_handler.init_error_table`.
+    """
     logger_main = setup_logging()
     logger_main.info("=" * 49)
     logger_main.info(f"{' nif-pt consulta_nif a iniciar ':=^49}")

@@ -76,8 +76,18 @@ TIPO_GENERIC_ERROR = "generic_error"
 
 # --- Helpers config / DB -----------------------------------------------------
 
-def _get_config():
-    """Lê config via get_config('consulta_nif') com fallback seguro."""
+def _get_config() -> dict:
+    """Lê configuração de resiliência via :func:`config.config.get_config`.
+
+    Returns:
+        Dict de ``get_config("consulta_nif")`` ou ``{}`` se falhar
+        (nunca levanta — usado por :func:`get_tempo_espera` e
+        :func:`get_max_tentativas`).
+
+    Examples:
+        >>> isinstance(_get_config(), dict)
+        True
+    """
     try:
         from config.config import get_config
         cfg = get_config("consulta_nif")
@@ -88,6 +98,15 @@ def _get_config():
 
 
 def _get_db_path() -> Path:
+    """Resolve o caminho absoluto de ``data/nif_pt.db`` a partir do config.
+
+    Returns:
+        ``Path`` absoluto para a BD SQLite (``data/nif_pt.db`` por defeito).
+
+    Examples:
+        >>> _get_db_path().name
+        'nif_pt.db'
+    """
     cfg = _get_config()
     # importar_nif_sqlite usa cfg.get("db_path") relativo à raiz do projeto
     db_path_cfg = cfg.get("db_path", "data/nif_pt.db")
@@ -100,6 +119,16 @@ def _get_db_path() -> Path:
 
 
 def _get_connection() -> sqlite3.Connection:
+    """Abre ligação SQLite com WAL e garante DDL de ``nif_api_erros``.
+
+    Returns:
+        ``sqlite3.Connection`` aberta com ``journal_mode=WAL`` e
+        ``DDL_ERROS`` + índices garantidos.
+
+    Examples:
+        >>> conn = _get_connection()  # doctest: +SKIP
+        >>> conn.close()  # doctest: +SKIP
+    """
     db_path = _get_db_path()
     logger.debug("[erro] DB_PATH=%s", db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,7 +152,19 @@ def _get_connection() -> sqlite3.Connection:
 
 
 def init_error_table() -> None:
-    """Garante que a tabela de erros existe (idempotente)."""
+    """Garante que a tabela ``nif_api_erros`` existe (idempotente).
+
+    Abre ligação via :func:`_get_connection` (que já executa ``DDL_ERROS``)
+    e fecha imediatamente. Chamado no arranque de :func:`consulta_nif.main`
+    antes de qualquer request.
+
+    Returns:
+        ``None`` — efeito colateral é criação da tabela se faltar.
+
+    Examples:
+        >>> init_error_table()  # doctest: +SKIP
+        >>> # tabela garantida em data/nif_pt.db
+    """
     logger.debug(f"{' init_error_table() ':~^49}")
     t = time.perf_counter()
     conn = _get_connection()
@@ -213,7 +254,20 @@ def classificar_erro(data: dict) -> str:
 
 
 def get_tempo_espera(tipo_erro: str) -> int:
-    """Devolve tempo de espera em segundos para o tipo, lido do config.yaml."""
+    """Devolve tempo de espera em segundos para o tipo, lido do ``config.yaml``.
+
+    Args:
+        tipo_erro: Uma das constantes ``TIPO_*`` (ex. ``rate_limit_minute``).
+
+    Returns:
+        ``60`` para ``minute`` (``tempo_espera_minuto``), ``3600`` para ``hour``
+        (``tempo_espera_hora``), ``0`` para ``day/month/paid/unknown``
+        (abort sem espera, lido de ``tempo_de_espera`` como fallback).
+
+    Examples:
+        >>> get_tempo_espera("rate_limit_minute") in (60, 0)  # doctest: +SKIP
+        True
+    """
     cfg = _get_config()
     if tipo_erro == TIPO_RATE_LIMIT_MINUTE:
         return int(cfg.get("tempo_espera_minuto", cfg.get("tempo_de_espera", 60)))
@@ -224,7 +278,22 @@ def get_tempo_espera(tipo_erro: str) -> int:
 
 
 def get_max_tentativas(tipo_erro: str) -> int:
-    """Devolve número máximo de tentativas para o tipo, lido do config.yaml."""
+    """Devolve número máximo de tentativas para o tipo, lido do ``config.yaml``.
+
+    Args:
+        tipo_erro: Constante ``TIPO_*``.
+
+    Returns:
+        ``max_tentativas_minuto`` (default ``3``) para minute,
+        ``max_tentativas_hora`` (``2``) para hour,
+        ``0`` para ``day/month/paid`` (abort imediato),
+        ``max_tentativas_generico`` (``0``) para ``unknown/generic``.
+        Fallback para ``retry_count`` se chave não existir.
+
+    Examples:
+        >>> get_max_tentativas("rate_limit_minute") >= 0
+        True
+    """
     cfg = _get_config()
     # fallback para retry_count se nova chave não existir (compat)
     if tipo_erro == TIPO_RATE_LIMIT_MINUTE:
@@ -242,14 +311,36 @@ def get_max_tentativas(tipo_erro: str) -> int:
 
 
 def get_max_tentativas_global() -> int:
-    """Devolve limite global de tentativas falhadas."""
+    """Devolve limite global de tentativas falhadas (``max_tentativas_global``).
+
+    Returns:
+        ``int`` de ``config.yaml`` (default ``5``, fallback ``retry_count``).
+
+    Examples:
+        >>> get_max_tentativas_global() >= 1
+        True
+    """
     cfg = _get_config()
     return int(cfg.get("max_tentativas_global", cfg.get("retry_count", 1)))
 
 
 # --- Persistência ------------------------------------------------------------
 
-def _safe_int(v):
+def _safe_int(v) -> int | None:
+    """Converte para ``int`` sem levantar; ``None`` ou falha → ``None``.
+
+    Args:
+        v: Valor a converter (``left.*`` pode ser ``None`` ou string).
+
+    Returns:
+        ``int`` ou ``None``.
+
+    Examples:
+        >>> _safe_int("5")
+        5
+        >>> _safe_int(None) is None
+        True
+    """
     try:
         if v is None:
             return None
@@ -267,9 +358,29 @@ def guardar_erro(
     dados_completos: dict,
     acao: str | None = None,
 ) -> int | None:
-    """
-    Guarda o erro na tabela nif_api_erros.
-    Retorna o id inserido ou None se falhar.
+    """Guarda o erro na tabela ``nif_api_erros`` (SQLite, WAL).
+
+    Persiste ``nif``, ``tipo_erro``, ``codigo_erro`` (``result`` da API),
+    ``mensagem`` (``message``), ``left_*`` (``credits.left``), ``dados_json``
+    (payload completo), ``acao`` (``retry_60s`` / ``abort_day`` / ``none``)
+    e ``resolvido=0``.
+
+    Args:
+        nif: NIF consultado (str ou int; ``None`` → ``NULL``).
+        tipo_erro: Constante ``TIPO_*`` de :func:`classificar_erro`.
+        codigo_erro: ``data["result"]`` (ex. ``"error"``).
+        mensagem: ``data["message"]`` truncável a 500 chars no DDL Azure.
+        left: ``data["credits"]["left"]`` (dict ou ``None``/``[]``).
+        dados_completos: Payload completo da API (serializado para JSON).
+        acao: ``"retry_60s"`` / ``"retry_3600s"`` / ``"abort_day"`` / ``"none"``.
+
+    Returns:
+        ``id`` (``lastrowid``) do registo inserido ou ``None`` se falhar
+        (logado com ``[erro] Falha ao guardar`` e ``rollback``).
+
+    Examples:
+        >>> guardar_erro("509442013", "rate_limit_minute", "error", "Limit per minute", {"minute": 0}, {"result": "error"})  # doctest: +SKIP
+        1
     """
     logger.debug(f"{' guardar_erro() ':~^49}")
     t = time.perf_counter()
@@ -607,6 +718,22 @@ def tratar_erro(
 
 # Alias para compatibilidade com enunciado: "recebe a mensagem de erro e a trata"
 def handle_error(nif: str, data: dict, attempt: int = 0, retry_count: int = 1, tentativas_por_tipo: dict | None = None, tentativa_global: int | None = None) -> dict:
-    """Alias de tratar_erro()."""
+    """Alias de :func:`tratar_erro` (compatibilidade enunciado).
+
+    Args:
+        nif: Ver :func:`tratar_erro`.
+        data: Ver :func:`tratar_erro`.
+        attempt: Ver :func:`tratar_erro`.
+        retry_count: Ver :func:`tratar_erro`.
+        tentativas_por_tipo: Ver :func:`tratar_erro`.
+        tentativa_global: Ver :func:`tratar_erro`.
+
+    Returns:
+        Mesmo dict de :func:`tratar_erro`.
+
+    Examples:
+        >>> handle_error("509442013", {"result": "error", "message": "Limit per minute"})  # doctest: +SKIP
+        {'tipo': 'rate_limit_minute', 'acao': 'retry', ...}
+    """
     return tratar_erro(nif, data, attempt, retry_count, tentativas_por_tipo, tentativa_global)
 

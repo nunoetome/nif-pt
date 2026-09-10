@@ -1,9 +1,26 @@
 #!/usr/bin/env python3
 """
-nif-pt — Ponto de entrada principal (stub orquestrador).
+main — Ponto de entrada orquestrador (stub) do nif-pt.
 
-Futuro: argparse --nif --to {sqlite,azure,both} --file
-Atual: demonstra BANNER_APP + BOX + logging.
+Futuro: ``argparse --nif --to {sqlite,azure,both} --file`` para orquestrar
+:mod:`consulta_nif` + :mod:`importar_nif_sqlite` / :mod:`importar_nif` sem
+``tee``. Atual: demonstra ``BANNER_APP`` + ``BOX`` + logging com
+:mod:`Logging.logging_orchestrator`.
+
+Uso:
+    python main.py
+    # Futuro:
+    # python main.py --nif 509442013 --to both
+    # python main.py --file nifs.txt --to sqlite
+
+Exemplos:
+    >>> import main  # doctest: +SKIP
+    >>> main.main()  # doctest: +SKIP
+    NIF.pt - Recolha de dados
+
+See Also:
+    :mod:`consulta_nif`, :mod:`importar_nif`, :mod:`importar_nif_sqlite`,
+    :mod:`Logging.logging_orchestrator`
 """
 
 import logging
@@ -15,6 +32,23 @@ logger = logging.getLogger(__name__)
 
 
 def main():
+    """Executa o stub orquestrador — loga BANNERs + BOX de ajuda.
+
+    Demonstra o livro de estilo R1–R9 (``= 49`` para app, ``- 49`` para
+    secção, ``BOX`` ``| ... |``, TAG ``[cli]``, TIMING ``%.2fs``) e imprime
+    ajuda de pipeline em ``stdout`` para compatibilidade.
+
+    A função não recebe argumentos nem devolve valor; termina sempre com
+    ``exit 0`` implícito. Futuramente aceitará ``argparse``.
+
+    Returns:
+        ``None`` — efeito colateral é logging + ``print`` em stdout.
+
+    Examples:
+        >>> main()  # doctest: +SKIP
+        <<nif-pt>> INFO - ===================================================
+        <<nif-pt>> INFO - ================ nif-pt a iniciar ===============
+    """
     logger_main = setup_logging()
     logger_main.info("=" * 49)
     logger_main.info(f"{' nif-pt a iniciar ':=^49}")

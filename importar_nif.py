@@ -1,16 +1,38 @@
 #!/usr/bin/env python3
 """
-Importa o JSON do consulta_nif.py para a tabela de staging na Azure SQL.
+importar_nif — Normaliza JSON do consulta_nif.py e insere em Azure SQL staging.
+
+Lê JSON de ``stdin`` (pipeline), valida, mapeia 36 colunas via
+:func:`mapear_registo` e insere em ``{sql_schema}.{tabela_staging}``
+(``stg_nunotome.nif_pt_stg`` por defeito) via ``pyodbc`` + ``ODBC Driver 18``.
 
 Uso:
     python consulta_nif.py 509442013 | python importar_nif.py
     python importar_nif.py < ficheiro.json
+    python consulta_nif.py 509442013 > tmp.json && python importar_nif.py < tmp.json
 
-Insere sempre em nif_pt_stg. O tratamento e migração para nif_pt
-é feito posteriormente noutro processo.
+    Insere sempre em ``nif_pt_stg``. A promoção para ``nif_pt`` é feita
+    por ``MERGE`` / procedure noutro processo.
 
-A configuração (servidor, base de dados, schema, nomes das tabelas)
-é lida do config.yaml e .env via config.py.
+Configuração (``config/config.py:get_config("importar_nif")``):
+    * ``sql_server`` — ``kiwa-pt-operations.database.windows.net``
+    * ``sql_database`` — ``kiwa-pt-operations``
+    * ``sql_schema`` — ``stg_nunotome``
+    * ``sql_driver`` — ``ODBC Driver 18 for SQL Server``
+    * ``tabela_staging`` — ``nif_pt_stg``
+    * ``AZURE_USER`` / ``AZURE_PALAVRA_CHAVE`` — ``config/.env``
+
+Exemplos:
+    >>> from importar_nif import mapear_registo
+    >>> r = {"nif": "509442013", "fonte": "nif.pt", "nif_valido_formato": True,
+    ...      "dados": {"title": "X", "place": {"city": "Porto"}, "contacts": {}},
+    ...      "creditos": {"used": "free", "left": []}}
+    >>> m = mapear_registo(r)
+    >>> m["nif"], m["place_city"]
+    (509442013, 'Porto')
+
+See Also:
+    :mod:`consulta_nif`, :mod:`importar_nif_sqlite`, :mod:`utils.error_handler`
 """
 
 import json
@@ -37,6 +59,25 @@ AZURE_PALAVRA_CHAVE = cfg.get("AZURE_PALAVRA_CHAVE", "")
 
 
 def connection_string() -> str:
+    """Constrói a *connection string* ODBC para Azure SQL.
+
+    Usa ``SQL_DRIVER`` / ``SQL_SERVER`` / ``SQL_DATABASE`` / ``AZURE_USER`` /
+    ``AZURE_PALAVRA_CHAVE`` de ``config.yaml`` + ``.env``, com
+    ``Encrypt=yes;TrustServerCertificate=no;`` (exigido pelo Azure).
+
+    Returns:
+        String ``DRIVER={...};SERVER=...;DATABASE=...;UID=...;PWD=...;Encrypt=yes;...``.
+        A password **não** é logada; user é mascarado no :func:`main`.
+
+    Examples:
+        >>> cs = connection_string()  # doctest: +SKIP
+        >>> "ODBC Driver 18" in cs
+        True
+
+    Notas:
+        * TIMING ``%.2fs`` (R9) + TAG ``[db]``.
+        * ``TrustServerCertificate=no`` — falhar se certificado inválido.
+    """
     logger.debug(f"{' connection_string() ':~^49}")
     t = time.perf_counter()
     cs = (
@@ -52,6 +93,26 @@ def connection_string() -> str:
 
 
 def extrair_cae(registo: dict) -> str | None:
+    """Extrai CAE(s) do registo nif.pt como CSV.
+
+    A API devolve ``cae`` como ``list`` (ex. ``["62010","63120"]``) ou
+    ``str``. A função normaliza para string única com vírgulas.
+
+    Args:
+        registo: ``resultado["dados"]`` (dict com chave ``cae``).
+
+    Returns:
+        ``"62010,63120"`` se lista, ``str(cae)`` se string, ``None`` se
+        ausente/``None``.
+
+    Examples:
+        >>> extrair_cae({"cae": ["62010", "63120"]})
+        '62010,63120'
+        >>> extrair_cae({"cae": "62010"})
+        '62010'
+        >>> extrair_cae({}) is None
+        True
+    """
     cae = registo.get("cae")
     if isinstance(cae, list):
         joined = ",".join(str(c) for c in cae)
@@ -64,6 +125,27 @@ def extrair_cae(registo: dict) -> str | None:
 
 
 def parse_date(val) -> date | None:
+    """Converte valor de data da API para ``datetime.date``.
+
+    Aceita ``YYYY-MM-DD`` (ISO) com ou sem ``Z`` e já-``date``. Falhas
+    devolvem ``None`` sem levantar.
+
+    Args:
+        val: Valor de ``dados.start_date`` (str, date ou falsy).
+
+    Returns:
+        ``date`` ou ``None`` se vazio / inválido.
+
+    Examples:
+        >>> parse_date("2010-05-18")
+        datetime.date(2010, 5, 18)
+        >>> parse_date("2010-05-18Z")
+        datetime.date(2010, 5, 18)
+        >>> parse_date("") is None
+        True
+        >>> parse_date(None) is None
+        True
+    """
     if not val:
         return None
     if isinstance(val, date):
@@ -78,6 +160,25 @@ def parse_date(val) -> date | None:
 
 
 def parse_capital(val) -> float | None:
+    """Converte capital social da API para ``float``.
+
+    A API devolve ``"248000.00"`` ou ``"248.000,00"`` (PT). A função troca
+    vírgula por ponto antes de ``float()``.
+
+    Args:
+        val: ``dados.structure.capital`` (str/float/None).
+
+    Returns:
+        ``float`` ou ``None`` se vazio / inválido.
+
+    Examples:
+        >>> parse_capital("248000.00")
+        248000.0
+        >>> parse_capital("248,50")
+        248.5
+        >>> parse_capital(None) is None
+        True
+    """
     if not val:
         return None
     try:
@@ -90,6 +191,24 @@ def parse_capital(val) -> float | None:
 
 
 def parse_int(val) -> int | None:
+    """Converte valor para ``int`` de forma segura.
+
+    Usado para ``creditos.left.*``. ``None`` ou falha → ``None``.
+
+    Args:
+        val: Valor a converter.
+
+    Returns:
+        ``int`` ou ``None``.
+
+    Examples:
+        >>> parse_int("5")
+        5
+        >>> parse_int(None) is None
+        True
+        >>> parse_int("abc") is None
+        True
+    """
     if val is None:
         return None
     try:
@@ -101,6 +220,44 @@ def parse_int(val) -> int | None:
 
 
 def mapear_registo(resultado: dict) -> dict:
+    """Mapeia o JSON normalizado de :func:`consulta_nif.consultar_nif` para 36 colunas SQL.
+
+    Desembrulha ``resultado["dados"]`` (``place``, ``geo``, ``contacts``,
+    ``structure``, ``cae``) + ``resultado["creditos"]`` e aplica
+    :func:`parse_date` / :func:`parse_capital` / :func:`parse_int` /
+    :func:`extrair_cae`. Trata o caso ``credits.left == []`` (free plan →
+    ``{}``).
+
+    Args:
+        resultado: Dict devolvido por :func:`consulta_nif.consultar_nif`
+            (``nif``, ``fonte``, ``dados``, ``creditos``, ``nif_valido_formato``).
+
+    Returns:
+        Dict com 36 chaves — ordem de :func:`colunas_tabela`:
+
+        * ``nif`` (int), ``nif_valido_formato`` (0/1), ``consulta_origem``,
+        * ``seo_url``, ``title``, ``alias``, ``status``, ``start_date`` (date|None),
+          ``activity``,
+        * ``place_address/pc4/pc3/city``, ``address/pc4/pc3/city``,
+        * ``geo_region/county/parish``,
+        * ``contacts_email/phone/website/fax``,
+        * ``structure_nature/capital/capital_currency``,
+        * ``cae`` (CSV), ``racius``, ``portugalio``,
+        * ``creditos_used``, ``creditos_left_month/day/hour/minute/paid`` (int|None).
+
+    Examples:
+        >>> r = {"nif": "509442013", "fonte": "nif.pt", "nif_valido_formato": True,
+        ...      "dados": {"title": "X", "cae": ["62010"], "place": {"city": "Porto"},
+        ...                "contacts": {"email": "a@b.pt"}, "structure": {"capital": "1000"}},
+        ...      "creditos": {"used": "free", "left": []}}
+        >>> mapear_registo(r)["cae"]
+        '62010'
+        >>> mapear_registo(r)["creditos_left_month"] is None
+        True
+
+    See Also:
+        :func:`colunas_tabela`, :func:`valores_para_insert`, :func:`extrair_cae`
+    """
     logger.debug(f"{' mapear_registo() ':~^49}")
     t = time.perf_counter()
     r = resultado.get("dados") or {}
@@ -167,6 +324,21 @@ def mapear_registo(resultado: dict) -> dict:
 
 
 def colunas_tabela() -> list[str]:
+    """Devolve a lista ordenada das 36 colunas para ``INSERT`` em ``nif_pt_stg``.
+
+    Exclui colunas com ``DEFAULT`` (``id``, ``data_consulta``,
+    ``data_staging``, ``processado``) — o ``INSERT`` omite-as intencionalmente.
+
+    Returns:
+        Lista de 36 nomes — 1 ``nif`` + 35 restantes na ordem do DDL
+        ``sql/01_criar_tabelas.sql``.
+
+    Examples:
+        >>> len(colunas_tabela())
+        36
+        >>> colunas_tabela()[:3]
+        ['nif', 'nif_valido_formato', 'consulta_origem']
+    """
     return [
         "nif", "nif_valido_formato", "consulta_origem",
         "seo_url", "title", "alias", "status", "start_date", "activity",
@@ -182,15 +354,62 @@ def colunas_tabela() -> list[str]:
 
 
 def placeholders() -> str:
+    """Gera placeholders ``?`` para ``pyodbc`` na ordem de :func:`colunas_tabela`.
+
+    Returns:
+        String ``"?,?,?,?,..."`` com 36 ``?`` separados por vírgula.
+
+    Examples:
+        >>> placeholders().count("?")
+        36
+    """
     return ",".join("?" for _ in colunas_tabela())
 
 
 def valores_para_insert(reg: dict) -> list:
+    """Extrai valores do dict mapeado na ordem de :func:`colunas_tabela`.
+
+    Args:
+        reg: Dict devolvido por :func:`mapear_registo`.
+
+    Returns:
+        Lista de 36 valores na ordem das colunas — pronta para
+        ``cursor.execute(sql, valores_para_insert(reg))``.
+
+    Examples:
+        >>> reg = {"nif": 509442013, "title": "X"}
+        >>> valores_para_insert(reg)[0]
+        509442013
+    """
     cols = colunas_tabela()
     return [reg.get(c) for c in cols]
 
 
 def main():
+    """Ponto de entrada CLI — lê JSON de stdin, mapeia e insere em Azure SQL.
+
+    Fluxo:
+
+    1. ``setup_logging()`` + BANNER ``= 49``.
+    2. ``sys.stdin.read()`` — ``exit 1`` se vazio.
+    3. ``json.loads`` — ``exit 1`` se inválido.
+    4. Se ``resultado["erro"]`` → log + ``exit 1`` (não insere).
+    5. ``mapear_registo(resultado)`` → 36 cols.
+    6. Valida ``AZURE_USER`` / ``AZURE_PALAVRA_CHAVE`` — ``exit 1`` se falta.
+    7. ``pyodbc.connect(connection_string(), timeout=30)`` com ``autocommit=False``.
+    8. ``INSERT INTO {TABELA_STAGING} (36 cols) VALUES (36 ?)`` + ``commit``
+       (``rollback`` em ``pyodbc.Error``) + BOX ``Inserido em Azure SQL``.
+
+    Args:
+        Nenhum — lê ``sys.stdin`` integralmente.
+
+    Returns:
+        Não retorna — ``sys.exit(0)`` em sucesso, ``sys.exit(1)`` em erro.
+        ``stderr`` com TAGs ``[io][map][db]``; ``stdout`` vazio.
+
+    See Also:
+        :func:`mapear_registo`, :func:`connection_string`, :func:`colunas_tabela`
+    """
     logger_main = setup_logging()
     logger_main.info("=" * 49)
     logger_main.info(f"{' nif-pt importar_nif a iniciar ':=^49}")

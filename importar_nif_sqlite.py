@@ -1,14 +1,36 @@
 #!/usr/bin/env python3
 """
-Guarda o JSON do consulta_nif.py numa base de dados SQLite.
+importar_nif_sqlite — Persiste JSON do consulta_nif.py em SQLite local.
 
-Cria automaticamente a base de dados e a tabela se não existir.
+Cria ``data/nif_pt.db`` (WAL) e a tabela ``nif_pt`` se não existir, e insere
+o JSON completo como ``TEXT`` (schemaless). Lê de ``stdin`` para operar em
+pipeline Unix.
 
 Uso:
     python consulta_nif.py 509442013 | python importar_nif_sqlite.py
     python importar_nif_sqlite.py < ficheiro.json
+    python consulta_nif.py 509442013 > tmp.json && python importar_nif_sqlite.py < tmp.json
 
-A configuração é lida do config.yaml via config.py.
+Configuração:
+    Lida via :func:`config.config.get_config` (``importar_nif_sqlite``):
+
+    * ``db_path`` — ``data/nif_pt.db`` (relativo à raiz)
+    * ``tabela`` — ``nif_pt``
+
+Esquema SQLite (``nif_pt`` — 4 colunas):
+    * ``id INTEGER PRIMARY KEY AUTOINCREMENT``
+    * ``nif INTEGER NOT NULL``
+    * ``dados TEXT NOT NULL`` — ``json.dumps(resultado, ensure_ascii=False)``
+    * ``data_consulta TEXT NOT NULL DEFAULT (datetime('now'))``
+
+    ``PRAGMA journal_mode=WAL`` mitiga ``database is locked``.
+
+Exemplos:
+    >>> # pipeline (doctest: +SKIP)
+    >>> # $ echo '{"nif":"509442013","erro":null,"dados":{"title":"X"}}' | python importar_nif_sqlite.py
+
+See Also:
+    :mod:`consulta_nif`, :mod:`importar_nif`, :mod:`utils.error_handler`
 """
 
 import json
@@ -40,6 +62,27 @@ CREATE TABLE IF NOT EXISTS {TABELA} (
 
 
 def get_db() -> sqlite3.Connection:
+    """Abre (e cria se necessário) a ligação SQLite com WAL e DDL garantido.
+
+    * Cria ``DB_PATH.parent`` com ``mkdir(parents=True, exist_ok=True)``.
+    * Liga com ``sqlite3.connect(str(DB_PATH))``.
+    * Executa ``PRAGMA journal_mode=WAL`` (logado, falha não fatal).
+    * Executa ``SQL_DDL`` (``CREATE TABLE IF NOT EXISTS nif_pt``) e ``commit``.
+
+    Returns:
+        ``sqlite3.Connection`` aberta com WAL activo e tabela garantida.
+        O chamador deve fazer ``cursor.close()`` / ``conn.close()``.
+
+    Examples:
+        >>> conn = get_db()  # doctest: +SKIP
+        >>> conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()  # doctest: +SKIP
+        [('nif_pt',)]
+
+    Notas:
+        * WAL permite leitura concorrente; para escrita concorrente intensa
+          considerar ``PRAGMA busy_timeout=5000``.
+        * TAG ``[sqlite]`` + TIMING (R9).
+    """
     logger.debug(f"{' get_db() ':~^49}")
     t = time.perf_counter()
     logger.debug("[sqlite] DB_PATH=%s parent mkdir", DB_PATH)
@@ -60,6 +103,33 @@ def get_db() -> sqlite3.Connection:
 
 
 def main():
+    """Ponto de entrada CLI — lê JSON de stdin e insere em SQLite.
+
+    Fluxo:
+
+    1. ``setup_logging()`` + BANNER ``= 49``.
+    2. ``sys.stdin.read()`` — ``exit 1`` se vazio (pipeline quebrado).
+    3. ``json.loads`` — ``exit 1`` se inválido.
+    4. Se ``resultado["erro"]`` existe → ``exit 1`` sem inserir (propaga erro
+       do :mod:`consulta_nif`).
+    5. ``get_db()`` + ``INSERT INTO nif_pt (nif, dados, data_consulta)
+       VALUES (?, ?, ?)`` com ``json.dumps(resultado, ensure_ascii=False)``.
+    6. BOX ``Guardado em SQLite`` + TIMING + BANNER fim.
+
+    Args:
+        Nenhum — lê ``sys.stdin`` integralmente.
+
+    Returns:
+        Não retorna — ``sys.exit(0)`` em sucesso, ``sys.exit(1)`` em erro.
+        Mensagens humanas em ``stderr`` (não quebram pipe).
+
+    Examples:
+        >>> # $ python consulta_nif.py 509442013 | python importar_nif_sqlite.py  (doctest: +SKIP)
+        >>> # <<nif-pt>> INFO - [sqlite] INSERT nif_pt nif=509442013 -> 1 row em 0.02s
+
+    See Also:
+        :func:`get_db`, :mod:`consulta_nif`, :mod:`utils.error_handler`
+    """
     logger_main = setup_logging()
     logger_main.info("=" * 49)
     logger_main.info(f"{' nif-pt importar_nif_sqlite a iniciar ':=^49}")
