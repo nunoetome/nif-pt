@@ -11,5 +11,8 @@ config/.env
 
 .DS_Store
 venv/
+.venv/
 *.db
 data/
+.opencode/
+log_files/

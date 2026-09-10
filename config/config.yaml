@@ -1,6 +1,6 @@
 default:
-  retry_count: 0
-  timeout: 1000
+  retry_count: 1
+  timeout: 10
   tempo_de_espera: 60
 
 # ==============================================================================
