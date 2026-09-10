@@ -2,6 +2,9 @@ default:
   retry_count: 1
   timeout: 10
   tempo_de_espera: 60
+  # Tratamento de erros rate-limit nif.pt — tempos de espera por janela
+  tempo_espera_minuto: 60
+  tempo_espera_hora: 3600
 
 # ==============================================================================
 # consulta_nif.py — consulta à API pública nif.pt

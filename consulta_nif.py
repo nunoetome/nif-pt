@@ -28,6 +28,9 @@ API_KEY = cfg.get("NIF_PT_KEY")
 TIMEOUT = cfg.get("timeout", 10)
 RETRY_COUNT = cfg.get("retry_count", 1)
 TEMPO_ESPERA = cfg.get("tempo_de_espera", 60)
+# Tempos específicos por janela rate-limit (nova camada erro)
+TEMPO_ESPERA_MINUTO = cfg.get("tempo_espera_minuto", 60)
+TEMPO_ESPERA_HORA = cfg.get("tempo_espera_hora", 3600)
 
 # Aviso se timeout excessivo
 if TIMEOUT and TIMEOUT > 60:
@@ -132,33 +135,66 @@ def consultar_nif(nif: str) -> dict:
             logger.error("[api] Resposta não JSON de nif.pt nif=%s body_len=%d (%.2fs)", nif, body_len, elapsed)
             return {"nif": nif, "valido": validar_nif(nif), "fonte": "nif.pt", "erro": "Resposta inválida (não JSON) da API", "dados": None}
 
-        # Sucesso HTTP mas result pode ser error
+        # Sucesso HTTP mas result pode ser error -> delega à nova camada erro
         if data.get("result") != "success":
             result = data.get("result", "Erro desconhecido da API")
             message = data.get("message", "")
-            # mensagem mais útil que result genérico
             erro_msg = message or result
-            # Rate-limit: retry
-            if "Limit per minute" in str(message) or "Limit per" in str(result):
-                creditos = data.get("credits", {})
-                left = creditos.get("left", {}) if isinstance(creditos.get("left"), dict) else {}
-                logger.warning(
-                    "[api] Rate-limit atingido nif=%s result='%s' message='%s' credits left_minute=%s tentativa %d/%d",
-                    nif, result, message, left.get("minute") if isinstance(left, dict) else "[]", attempt + 1, RETRY_COUNT + 1
-                )
-                if attempt < RETRY_COUNT:
-                    logger.warning("[api] Retry rate-limit em %ss", TEMPO_ESPERA)
-                    time.sleep(TEMPO_ESPERA)
+
+            # --- Nova camada: utils.error_handler ---
+            try:
+                from utils.error_handler import tratar_erro
+                decisao = tratar_erro(nif, data, attempt=attempt, retry_count=RETRY_COUNT)
+
+                tipo = decisao.get("tipo", "unknown")
+                acao = decisao.get("acao", "none")
+                espera = decisao.get("espera", 0)
+                deve_retry = decisao.get("deve_retry", False)
+
+                # Por minuto / hora -> retry com espera configurada
+                if acao == "retry" and deve_retry:
+                    logger.warning("[api] Retry agendado nif=%s tipo=%s espera=%ss (tratado por error_handler)", nif, tipo, espera)
+                    time.sleep(espera)
                     continue
-            logger.warning("[api] nif.pt result='%s' nif=%s valido=%s message='%s'", result, nif, validar_nif(nif), message)
-            logger.debug("[api] consultar_nif(%s) -> %s (%.2fs)", nif, result, time.perf_counter() - t_total)
-            return {
-                "nif": nif,
-                "valido": validar_nif(nif),
-                "fonte": "nif.pt",
-                "erro": erro_msg,
-                "dados": data,
-            }
+
+                # Por dia / mês -> abort fatal (já logado e persistido pelo handler)
+                if acao == "abort":
+                    logger.error("[api] Abort por quota nif=%s tipo=%s msg='%s'", nif, tipo, erro_msg)
+                    logger.debug("[api] consultar_nif(%s) -> %s ABORT (%.2fs)", nif, result, time.perf_counter() - t_total)
+                    return {
+                        "nif": nif,
+                        "valido": validar_nif(nif),
+                        "fonte": "nif.pt",
+                        "erro": erro_msg,
+                        "dados": data,
+                        "tipo_erro": tipo,
+                    }
+
+                # Genérico / retries esgotados -> devolve erro (já persistido)
+                if acao in ("abort", "none") and not deve_retry:
+                    logger.warning("[api] nif.pt result='%s' nif=%s valido=%s message='%s' tipo=%s", result, nif, validar_nif(nif), message, tipo)
+                    logger.debug("[api] consultar_nif(%s) -> %s (%.2fs)", nif, result, time.perf_counter() - t_total)
+                    return {
+                        "nif": nif,
+                        "valido": validar_nif(nif),
+                        "fonte": "nif.pt",
+                        "erro": erro_msg,
+                        "dados": data,
+                        "tipo_erro": tipo,
+                    }
+
+            except Exception as eh_err:
+                # Fallback se error_handler falhar — nunca quebrar fluxo principal
+                logger.warning("[erro] Falha no error_handler: %s — fallback para lógica antiga", eh_err)
+                logger.warning("[api] nif.pt result='%s' nif=%s valido=%s message='%s'", result, nif, validar_nif(nif), message)
+                logger.debug("[api] consultar_nif(%s) -> %s (%.2fs)", nif, result, time.perf_counter() - t_total)
+                return {
+                    "nif": nif,
+                    "valido": validar_nif(nif),
+                    "fonte": "nif.pt",
+                    "erro": erro_msg,
+                    "dados": data,
+                }
 
         records = data.get("records", {})
         registo = records.get(nif, records.get(list(records.keys())[0] if records else None))
@@ -197,6 +233,13 @@ def main():
     logger_main.info(f"{' nif-pt consulta_nif a iniciar ':=^49}")
     logger_main.info("=" * 49)
     t_app = time.perf_counter()
+
+    # Garantir tabela de erros existe antes de consultar (idempotente)
+    try:
+        from utils.error_handler import init_error_table
+        init_error_table()
+    except Exception as e:
+        logger_main.warning("[erro] Falha init tabela erros: %s", e)
 
     if TIMEOUT and TIMEOUT > 60:
         logger_main.warning("[cfg] timeout=%ss excessivo, recomendado 10s", TIMEOUT)
