@@ -31,6 +31,12 @@ TEMPO_ESPERA = cfg.get("tempo_de_espera", 60)
 # Tempos específicos por janela rate-limit (nova camada erro)
 TEMPO_ESPERA_MINUTO = cfg.get("tempo_espera_minuto", 60)
 TEMPO_ESPERA_HORA = cfg.get("tempo_espera_hora", 3600)
+# Limites de tentativas — por tipo e global
+MAX_TENTATIVAS_GLOBAL = cfg.get("max_tentativas_global", cfg.get("retry_count", 1))
+MAX_TENTATIVAS_MINUTO = cfg.get("max_tentativas_minuto", 3)
+MAX_TENTATIVAS_HORA = cfg.get("max_tentativas_hora", 2)
+MAX_TENTATIVAS_DIA = cfg.get("max_tentativas_dia", 0)
+MAX_TENTATIVAS_MES = cfg.get("max_tentativas_mes", 0)
 
 # Aviso se timeout excessivo
 if TIMEOUT and TIMEOUT > 60:
@@ -95,10 +101,15 @@ def consultar_nif(nif: str) -> dict:
     logger.info("[api] GET %s?q=%s key=%s timeout=%ss", API_BASE, nif, masked_key, TIMEOUT)
 
     last_error = None
-    for attempt in range(RETRY_COUNT + 1):
+    # Tracking — limites por tipo + global
+    tentativas_por_tipo: dict = {}
+    # Usa MAX global como limite do loop (fallback para retry_count legado)
+    max_global_loop = MAX_TENTATIVAS_GLOBAL
+    logger.debug("[api] Limites global=%d minuto=%d hora=%d dia=%d mes=%d", MAX_TENTATIVAS_GLOBAL, MAX_TENTATIVAS_MINUTO, MAX_TENTATIVAS_HORA, MAX_TENTATIVAS_DIA, MAX_TENTATIVAS_MES)
+    for tentativa_global in range(max_global_loop + 1):
         t_req = time.perf_counter()
         try:
-            logger.debug("[api] Tentativa %d/%d GET %s params q=%s", attempt + 1, RETRY_COUNT + 1, url, nif)
+            logger.debug("[api] Tentativa %d/%d GET %s params q=%s", tentativa_global + 1, max_global_loop + 1, url, nif)
             resp = requests.get(url, params=params, timeout=TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
@@ -111,23 +122,24 @@ def consultar_nif(nif: str) -> dict:
             )
         except requests.exceptions.Timeout:
             elapsed = time.perf_counter() - t_req
-            logger.error("[api] Timeout na consulta nif.pt?q=%s após %.2fs (timeout=%s) tentativa %d/%d", nif, elapsed, TIMEOUT, attempt + 1, RETRY_COUNT + 1)
+            logger.error("[api] Timeout na consulta nif.pt?q=%s após %.2fs (timeout=%s) tentativa %d/%d", nif, elapsed, TIMEOUT, tentativa_global + 1, max_global_loop + 1)
             last_error = {"nif": nif, "valido": validar_nif(nif), "fonte": "nif.pt", "erro": "Timeout na consulta à API nif.pt", "dados": None}
-            if attempt < RETRY_COUNT:
-                logger.warning("[api] Retry em %ss (tentativa %d/%d)", TEMPO_ESPERA, attempt + 1, RETRY_COUNT + 1)
+            # Timeout conta para limite global
+            if tentativa_global < max_global_loop:
+                logger.warning("[api] Retry timeout em %ss (global %d/%d)", TEMPO_ESPERA, tentativa_global + 1, max_global_loop + 1)
                 time.sleep(TEMPO_ESPERA)
                 continue
-            logger.debug("[api] consultar_nif(%s) -> FAIL Timeout (%.2fs)", nif, time.perf_counter() - t_total)
+            logger.debug("[api] consultar_nif(%s) -> FAIL Timeout global esgotado (%.2fs)", nif, time.perf_counter() - t_total)
             return last_error
         except requests.exceptions.RequestException as e:
             elapsed = time.perf_counter() - t_req
-            logger.error("[api] Erro de rede nif.pt?q=%s: %s (%.2fs) tentativa %d/%d", nif, e, elapsed, attempt + 1, RETRY_COUNT + 1)
+            logger.error("[api] Erro de rede nif.pt?q=%s: %s (%.2fs) tentativa %d/%d", nif, e, elapsed, tentativa_global + 1, max_global_loop + 1)
             last_error = {"nif": nif, "valido": validar_nif(nif), "fonte": "nif.pt", "erro": f"Erro de rede: {e}", "dados": None}
-            if attempt < RETRY_COUNT:
-                logger.warning("[api] Retry em %ss", TEMPO_ESPERA)
+            if tentativa_global < max_global_loop:
+                logger.warning("[api] Retry rede em %ss (global %d/%d)", TEMPO_ESPERA, tentativa_global + 1, max_global_loop + 1)
                 time.sleep(TEMPO_ESPERA)
                 continue
-            logger.debug("[api] consultar_nif(%s) -> FAIL rede (%.2fs)", nif, time.perf_counter() - t_total)
+            logger.debug("[api] consultar_nif(%s) -> FAIL rede global esgotado (%.2fs)", nif, time.perf_counter() - t_total)
             return last_error
         except json.JSONDecodeError:
             elapsed = time.perf_counter() - t_req
@@ -144,22 +156,51 @@ def consultar_nif(nif: str) -> dict:
             # --- Nova camada: utils.error_handler ---
             try:
                 from utils.error_handler import tratar_erro
-                decisao = tratar_erro(nif, data, attempt=attempt, retry_count=RETRY_COUNT)
+                decisao = tratar_erro(
+                    nif,
+                    data,
+                    attempt=tentativa_global,
+                    retry_count=RETRY_COUNT,
+                    tentativas_por_tipo=tentativas_por_tipo,
+                    tentativa_global=tentativa_global,
+                )
 
                 tipo = decisao.get("tipo", "unknown")
                 acao = decisao.get("acao", "none")
                 espera = decisao.get("espera", 0)
                 deve_retry = decisao.get("deve_retry", False)
 
+                # Actualiza contadores por tipo (para próxima iteração)
+                tentativas_por_tipo[tipo] = tentativas_por_tipo.get(tipo, 0) + 1
+
+                # Verifica limite global antes de retry
+                if tentativa_global >= max_global_loop:
+                    logger.error(
+                        "[api] Limite global atingido nif=%s tipo=%s global %d/%d — abort",
+                        nif, tipo, tentativa_global, max_global_loop,
+                    )
+                    logger.debug("[api] consultar_nif(%s) -> %s ABORT global (%.2fs)", nif, result, time.perf_counter() - t_total)
+                    return {
+                        "nif": nif,
+                        "valido": validar_nif(nif),
+                        "fonte": "nif.pt",
+                        "erro": erro_msg,
+                        "dados": data,
+                        "tipo_erro": tipo,
+                    }
+
                 # Por minuto / hora -> retry com espera configurada
                 if acao == "retry" and deve_retry:
-                    logger.warning("[api] Retry agendado nif=%s tipo=%s espera=%ss (tratado por error_handler)", nif, tipo, espera)
+                    logger.warning(
+                        "[api] Retry agendado nif=%s tipo=%s espera=%ss global %d/%d tipo %d/%d (tratado por error_handler)",
+                        nif, tipo, espera, tentativa_global + 1, max_global_loop + 1, tentativas_por_tipo[tipo], decisao.get("max_tipo"),
+                    )
                     time.sleep(espera)
                     continue
 
                 # Por dia / mês -> abort fatal (já logado e persistido pelo handler)
                 if acao == "abort":
-                    logger.error("[api] Abort por quota nif=%s tipo=%s msg='%s'", nif, tipo, erro_msg)
+                    logger.error("[api] Abort por quota nif=%s tipo=%s msg='%s' global %d/%d", nif, tipo, erro_msg, tentativa_global, max_global_loop)
                     logger.debug("[api] consultar_nif(%s) -> %s ABORT (%.2fs)", nif, result, time.perf_counter() - t_total)
                     return {
                         "nif": nif,
@@ -172,7 +213,7 @@ def consultar_nif(nif: str) -> dict:
 
                 # Genérico / retries esgotados -> devolve erro (já persistido)
                 if acao in ("abort", "none") and not deve_retry:
-                    logger.warning("[api] nif.pt result='%s' nif=%s valido=%s message='%s' tipo=%s", result, nif, validar_nif(nif), message, tipo)
+                    logger.warning("[api] nif.pt result='%s' nif=%s valido=%s message='%s' tipo=%s global %d/%d", result, nif, validar_nif(nif), message, tipo, tentativa_global, max_global_loop)
                     logger.debug("[api] consultar_nif(%s) -> %s (%.2fs)", nif, result, time.perf_counter() - t_total)
                     return {
                         "nif": nif,

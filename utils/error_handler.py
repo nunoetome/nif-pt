@@ -223,6 +223,30 @@ def get_tempo_espera(tipo_erro: str) -> int:
     return 0
 
 
+def get_max_tentativas(tipo_erro: str) -> int:
+    """Devolve número máximo de tentativas para o tipo, lido do config.yaml."""
+    cfg = _get_config()
+    # fallback para retry_count se nova chave não existir (compat)
+    if tipo_erro == TIPO_RATE_LIMIT_MINUTE:
+        return int(cfg.get("max_tentativas_minuto", cfg.get("retry_count", 1)))
+    if tipo_erro == TIPO_RATE_LIMIT_HOUR:
+        return int(cfg.get("max_tentativas_hora", 1))
+    if tipo_erro == TIPO_RATE_LIMIT_DAY:
+        return int(cfg.get("max_tentativas_dia", 0))
+    if tipo_erro == TIPO_RATE_LIMIT_MONTH:
+        return int(cfg.get("max_tentativas_mes", 0))
+    if tipo_erro == TIPO_RATE_LIMIT_PAID:
+        return int(cfg.get("max_tentativas_paid", 0))
+    # genérico / unknown — sem retry por defeito
+    return int(cfg.get("max_tentativas_generico", 0))
+
+
+def get_max_tentativas_global() -> int:
+    """Devolve limite global de tentativas falhadas."""
+    cfg = _get_config()
+    return int(cfg.get("max_tentativas_global", cfg.get("retry_count", 1)))
+
+
 # --- Persistência ------------------------------------------------------------
 
 def _safe_int(v):
@@ -319,21 +343,43 @@ def guardar_erro(
 
 # --- Dispatcher principal ----------------------------------------------------
 
-def tratar_erro(nif: str, data: dict, attempt: int = 0, retry_count: int = 1) -> dict:
+def tratar_erro(
+    nif: str,
+    data: dict,
+    attempt: int = 0,
+    retry_count: int = 1,
+    tentativas_por_tipo: dict | None = None,
+    tentativa_global: int | None = None,
+) -> dict:
     """
     Ponto de entrada principal da camada de tratamento de erros.
 
     Recebe a mensagem de erro (dict da API), decide tipo, persiste e
-    devolve instrução de ação.
+    devolve instrução de ação. Suporta limites por tipo + global.
+
+    Args:
+        nif: NIF consultado
+        data: dict da API (result/message/credits)
+        attempt: índice da tentativa atual (legado, 0-based) — usado se
+                 tentativas_por_tipo/tentativa_global não forem fornecidos
+        retry_count: max retries legado — fallback se novos limites não existirem
+        tentativas_por_tipo: dict {tipo: count} com contagem já efetuada por tipo
+                             (excluindo a atual). Se None, usa lógica legada.
+        tentativa_global: índice global de tentativas falhadas (0-based). Se None,
+                          usa `attempt`.
 
     Returns:
         {
           "tipo": str,            # TIPO_*
           "acao": "retry"|"abort"|"none",
           "espera": int,          # segundos a esperar (0 se abort/none)
-          "deve_retry": bool,     # True se deve fazer retry (attempt < retry_count e tipo permite)
+          "deve_retry": bool,     # True se deve fazer retry
           "mensagem": str,
-          "codigo": str
+          "codigo": str,
+          "max_tipo": int,        # limite por tipo usado
+          "max_global": int,      # limite global usado
+          "tentativas_tipo": int, # contagem atual do tipo
+          "tentativa_global": int
         }
     Para tipos day/month, o chamador deve encerrar a app (sys.exit(1))
     após este retorno — a função já logou e persistiu.
@@ -354,49 +400,154 @@ def tratar_erro(nif: str, data: dict, attempt: int = 0, retry_count: int = 1) ->
 
     logger.info("[erro] Tipo classificado nif=%s tipo=%s codigo='%s' msg='%.120s'", nif, tipo, codigo, mensagem)
 
+    # Helpers — limites por tipo + global (novo) vs legado
+    modo_novo = tentativas_por_tipo is not None or tentativa_global is not None
+    if modo_novo:
+        max_tipo = get_max_tentativas(tipo)
+        max_global = get_max_tentativas_global()
+        tenta_tipo = (tentativas_por_tipo or {}).get(tipo, 0)
+        tenta_global = tentativa_global if tentativa_global is not None else attempt
+        limite_tipo_ok = tenta_tipo < max_tipo
+        limite_global_ok = tenta_global < max_global
+        deve_retry_base = limite_tipo_ok and limite_global_ok
+        logger.debug(
+            "[erro] limites nif=%s tipo=%s tenta_tipo=%d/%d tenta_global=%d/%d -> tipo_ok=%s global_ok=%s",
+            nif, tipo, tenta_tipo, max_tipo, tenta_global, max_global, limite_tipo_ok, limite_global_ok,
+        )
+    else:
+        # legado: attempt / retry_count
+        max_tipo = retry_count
+        max_global = retry_count
+        tenta_tipo = attempt
+        tenta_global = attempt
+        deve_retry_base = attempt < retry_count
+
     # --- Decisão por tipo ---
     if tipo == TIPO_RATE_LIMIT_MINUTE:
         espera = get_tempo_espera(tipo)
-        deve_retry = attempt < retry_count
+        if modo_novo:
+            max_tipo = get_max_tentativas(tipo)
+            max_global = get_max_tentativas_global()
+            tenta_tipo = (tentativas_por_tipo or {}).get(tipo, 0)
+            tenta_global = tentativa_global if tentativa_global is not None else attempt
+            limite_tipo_ok = tenta_tipo < max_tipo
+            limite_global_ok = tenta_global < max_global
+            if not limite_global_ok:
+                deve_retry = False
+                motivo = f"limite global {tenta_global}/{max_global}"
+            elif not limite_tipo_ok:
+                deve_retry = False
+                motivo = f"limite tipo {tenta_tipo}/{max_tipo}"
+            else:
+                deve_retry = True
+                motivo = "ok"
+        else:
+            deve_retry = attempt < retry_count
+            motivo = "legado"
+            max_tipo = retry_count
+            max_global = retry_count
+            tenta_tipo = attempt
+            tenta_global = attempt
         acao = "retry" if deve_retry else "abort_retry_esgotado"
-        guardar_erro(nif, tipo, codigo, mensagem, left, data, acao=f"retry_{espera}s")
+        guardar_erro(nif, tipo, codigo, mensagem, left, data, acao=f"retry_{espera}s" if deve_retry else "abort_retry_esgotado")
         if deve_retry:
             logger.warning(
-                "[rate-limit] Limite por minuto atingido nif=%s left_minute=%s — espera %ss e retry %d/%d",
+                "[rate-limit] Limite por minuto nif=%s left_minute=%s — espera %ss retry tipo %d/%d global %d/%d (%s)",
                 nif,
                 left.get("minute") if isinstance(left, dict) else "?",
                 espera,
-                attempt + 1,
-                retry_count + 1,
+                tenta_tipo + 1,
+                max_tipo,
+                tenta_global + 1,
+                max_global,
+                motivo,
             )
         else:
-            logger.error("[rate-limit] Limite por minuto — retries esgotados nif=%s tentativa %d/%d", nif, attempt + 1, retry_count + 1)
+            logger.error(
+                "[rate-limit] Limite por minuto — retries esgotados nif=%s tipo %d/%d global %d/%d motivo=%s",
+                nif, tenta_tipo, max_tipo, tenta_global, max_global, motivo,
+            )
         logger.debug("[erro] tratar_erro(%s) -> %s (%.2fs)", nif, tipo, time.perf_counter() - t)
-        return {"tipo": tipo, "acao": "retry" if deve_retry else "abort", "espera": espera if deve_retry else 0, "deve_retry": deve_retry, "mensagem": mensagem, "codigo": codigo}
+        return {
+            "tipo": tipo,
+            "acao": "retry" if deve_retry else "abort",
+            "espera": espera if deve_retry else 0,
+            "deve_retry": deve_retry,
+            "mensagem": mensagem,
+            "codigo": codigo,
+            "max_tipo": max_tipo,
+            "max_global": max_global,
+            "tentativas_tipo": tenta_tipo,
+            "tentativa_global": tenta_global,
+        }
 
     if tipo == TIPO_RATE_LIMIT_HOUR:
         espera = get_tempo_espera(tipo)
-        deve_retry = attempt < retry_count
+        if modo_novo:
+            max_tipo = get_max_tentativas(tipo)
+            max_global = get_max_tentativas_global()
+            tenta_tipo = (tentativas_por_tipo or {}).get(tipo, 0)
+            tenta_global = tentativa_global if tentativa_global is not None else attempt
+            limite_tipo_ok = tenta_tipo < max_tipo
+            limite_global_ok = tenta_global < max_global
+            if not limite_global_ok:
+                deve_retry = False
+                motivo = f"limite global {tenta_global}/{max_global}"
+            elif not limite_tipo_ok:
+                deve_retry = False
+                motivo = f"limite tipo {tenta_tipo}/{max_tipo}"
+            else:
+                deve_retry = True
+                motivo = "ok"
+        else:
+            deve_retry = attempt < retry_count
+            motivo = "legado"
+            max_tipo = retry_count
+            max_global = retry_count
+            tenta_tipo = attempt
+            tenta_global = attempt
         acao = "retry" if deve_retry else "abort_retry_esgotado"
-        guardar_erro(nif, tipo, codigo, mensagem, left, data, acao=f"retry_{espera}s")
+        guardar_erro(nif, tipo, codigo, mensagem, left, data, acao=f"retry_{espera}s" if deve_retry else "abort_retry_esgotado")
         if deve_retry:
             logger.warning(
-                "[rate-limit] Limite por hora atingido nif=%s left_hour=%s — espera %ss (%dh) e retry %d/%d",
+                "[rate-limit] Limite por hora nif=%s left_hour=%s — espera %ss (%dh) retry tipo %d/%d global %d/%d (%s)",
                 nif,
                 left.get("hour") if isinstance(left, dict) else "?",
                 espera,
                 espera // 3600,
-                attempt + 1,
-                retry_count + 1,
+                tenta_tipo + 1,
+                max_tipo,
+                tenta_global + 1,
+                max_global,
+                motivo,
             )
         else:
-            logger.error("[rate-limit] Limite por hora — retries esgotados nif=%s", nif)
+            logger.error("[rate-limit] Limite por hora — retries esgotados nif=%s tipo %d/%d global %d/%d motivo=%s", nif, tenta_tipo, max_tipo, tenta_global, max_global, motivo)
         logger.debug("[erro] tratar_erro(%s) -> %s (%.2fs)", nif, tipo, time.perf_counter() - t)
-        return {"tipo": tipo, "acao": "retry" if deve_retry else "abort", "espera": espera if deve_retry else 0, "deve_retry": deve_retry, "mensagem": mensagem, "codigo": codigo}
+        return {
+            "tipo": tipo,
+            "acao": "retry" if deve_retry else "abort",
+            "espera": espera if deve_retry else 0,
+            "deve_retry": deve_retry,
+            "mensagem": mensagem,
+            "codigo": codigo,
+            "max_tipo": max_tipo,
+            "max_global": max_global,
+            "tentativas_tipo": tenta_tipo,
+            "tentativa_global": tenta_global,
+        }
 
     if tipo == TIPO_RATE_LIMIT_DAY:
+        max_tipo = get_max_tentativas(tipo)
+        max_global = get_max_tentativas_global()
+        tenta_tipo = (tentativas_por_tipo or {}).get(tipo, 0) if modo_novo else attempt
+        tenta_global = tentativa_global if tentativa_global is not None else attempt
+        # dia/mês são fatais; mesmo que max_tipo >0, aborta (config 0 por defeito)
         guardar_erro(nif, tipo, codigo, mensagem, left, data, acao="abort_day")
-        logger.error("[rate-limit] Limite por dia atingido nif=%s left_day=%s — a encerrar app", nif, left.get("day") if isinstance(left, dict) else "?")
+        logger.error(
+            "[rate-limit] Limite por dia atingido nif=%s left_day=%s tipo %d/%d global %d/%d — a encerrar app",
+            nif, left.get("day") if isinstance(left, dict) else "?", tenta_tipo, max_tipo, tenta_global, max_global,
+        )
         logger.info("-" * 49)
         logger.info("| Erro fatal - quota diária excedida               |")
         logger.info("| NIF         : %-30s |", str(nif))
@@ -404,11 +555,18 @@ def tratar_erro(nif: str, data: dict, attempt: int = 0, retry_count: int = 1) ->
         logger.info("| Mensagem    : %-30s |", mensagem[:30])
         logger.info("-" * 49)
         logger.debug("[erro] tratar_erro(%s) -> %s ABORT (%.2fs)", nif, tipo, time.perf_counter() - t)
-        return {"tipo": tipo, "acao": "abort", "espera": 0, "deve_retry": False, "mensagem": mensagem, "codigo": codigo}
+        return {"tipo": tipo, "acao": "abort", "espera": 0, "deve_retry": False, "mensagem": mensagem, "codigo": codigo, "max_tipo": max_tipo, "max_global": max_global, "tentativas_tipo": tenta_tipo, "tentativa_global": tenta_global}
 
     if tipo == TIPO_RATE_LIMIT_MONTH:
+        max_tipo = get_max_tentativas(tipo)
+        max_global = get_max_tentativas_global()
+        tenta_tipo = (tentativas_por_tipo or {}).get(tipo, 0) if modo_novo else attempt
+        tenta_global = tentativa_global if tentativa_global is not None else attempt
         guardar_erro(nif, tipo, codigo, mensagem, left, data, acao="abort_month")
-        logger.error("[rate-limit] Limite por mês atingido nif=%s left_month=%s — a encerrar app", nif, left.get("month") if isinstance(left, dict) else "?")
+        logger.error(
+            "[rate-limit] Limite por mês atingido nif=%s left_month=%s tipo %d/%d global %d/%d — a encerrar app",
+            nif, left.get("month") if isinstance(left, dict) else "?", tenta_tipo, max_tipo, tenta_global, max_global,
+        )
         logger.info("-" * 49)
         logger.info("| Erro fatal - quota mensal excedida               |")
         logger.info("| NIF         : %-30s |", str(nif))
@@ -416,31 +574,39 @@ def tratar_erro(nif: str, data: dict, attempt: int = 0, retry_count: int = 1) ->
         logger.info("| Mensagem    : %-30s |", mensagem[:30])
         logger.info("-" * 49)
         logger.debug("[erro] tratar_erro(%s) -> %s ABORT (%.2fs)", nif, tipo, time.perf_counter() - t)
-        return {"tipo": tipo, "acao": "abort", "espera": 0, "deve_retry": False, "mensagem": mensagem, "codigo": codigo}
+        return {"tipo": tipo, "acao": "abort", "espera": 0, "deve_retry": False, "mensagem": mensagem, "codigo": codigo, "max_tipo": max_tipo, "max_global": max_global, "tentativas_tipo": tenta_tipo, "tentativa_global": tenta_global}
 
     if tipo == TIPO_RATE_LIMIT_PAID:
+        max_tipo = get_max_tentativas(tipo)
+        max_global = get_max_tentativas_global()
+        tenta_tipo = (tentativas_por_tipo or {}).get(tipo, 0) if modo_novo else attempt
+        tenta_global = tentativa_global if tentativa_global is not None else attempt
         guardar_erro(nif, tipo, codigo, mensagem, left, data, acao="abort_paid")
-        logger.error("[rate-limit] Créditos pagos esgotados nif=%s — a encerrar app", nif)
+        logger.error("[rate-limit] Créditos pagos esgotados nif=%s tipo %d/%d global %d/%d", nif, tenta_tipo, max_tipo, tenta_global, max_global)
         logger.debug("[erro] tratar_erro(%s) -> %s ABORT (%.2fs)", nif, tipo, time.perf_counter() - t)
-        return {"tipo": tipo, "acao": "abort", "espera": 0, "deve_retry": False, "mensagem": mensagem, "codigo": codigo}
+        return {"tipo": tipo, "acao": "abort", "espera": 0, "deve_retry": False, "mensagem": mensagem, "codigo": codigo, "max_tipo": max_tipo, "max_global": max_global, "tentativas_tipo": tenta_tipo, "tentativa_global": tenta_global}
 
     # Genérico / unknown — guardar e devolver sem retry automático
     # (o chamador decide; por defeito não retry)
     if tipo in (TIPO_GENERIC_ERROR, TIPO_UNKNOWN):
         # Para erros genéricos da API (ex: NIF não encontrado), guardar como info mas não abortar por quota
         # Só persistimos para auditoria
+        max_tipo = get_max_tentativas(tipo)
+        max_global = get_max_tentativas_global()
+        tenta_tipo = (tentativas_por_tipo or {}).get(tipo, 0) if modo_novo else attempt
+        tenta_global = tentativa_global if tentativa_global is not None else attempt
         guardar_erro(nif, tipo, codigo, mensagem, left if isinstance(left, dict) else {}, data, acao="none")
-        logger.warning("[erro] Erro genérico API nif=%s tipo=%s msg='%.120s'", nif, tipo, mensagem)
+        logger.warning("[erro] Erro genérico API nif=%s tipo=%s msg='%.120s' tipo %d/%d global %d/%d", nif, tipo, mensagem, tenta_tipo, max_tipo, tenta_global, max_global)
         logger.debug("[erro] tratar_erro(%s) -> %s (%.2fs)", nif, tipo, time.perf_counter() - t)
-        return {"tipo": tipo, "acao": "none", "espera": 0, "deve_retry": False, "mensagem": mensagem, "codigo": codigo}
+        return {"tipo": tipo, "acao": "none", "espera": 0, "deve_retry": False, "mensagem": mensagem, "codigo": codigo, "max_tipo": max_tipo, "max_global": max_global, "tentativas_tipo": tenta_tipo, "tentativa_global": tenta_global}
 
     # fallback
     guardar_erro(nif, tipo, codigo, mensagem, left if isinstance(left, dict) else {}, data, acao="none")
-    return {"tipo": tipo, "acao": "none", "espera": 0, "deve_retry": False, "mensagem": mensagem, "codigo": codigo}
+    return {"tipo": tipo, "acao": "none", "espera": 0, "deve_retry": False, "mensagem": mensagem, "codigo": codigo, "max_tipo": 0, "max_global": get_max_tentativas_global(), "tentativas_tipo": 0, "tentativa_global": tentativa_global if tentativa_global is not None else attempt}
 
 
 # Alias para compatibilidade com enunciado: "recebe a mensagem de erro e a trata"
-def handle_error(nif: str, data: dict, attempt: int = 0, retry_count: int = 1) -> dict:
+def handle_error(nif: str, data: dict, attempt: int = 0, retry_count: int = 1, tentativas_por_tipo: dict | None = None, tentativa_global: int | None = None) -> dict:
     """Alias de tratar_erro()."""
-    return tratar_erro(nif, data, attempt, retry_count)
+    return tratar_erro(nif, data, attempt, retry_count, tentativas_por_tipo, tentativa_global)
 

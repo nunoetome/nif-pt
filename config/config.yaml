@@ -5,6 +5,13 @@ default:
   # Tratamento de erros rate-limit nif.pt — tempos de espera por janela
   tempo_espera_minuto: 60
   tempo_espera_hora: 3600
+  # Limites de tentativas — por tipo de erro e global
+  max_tentativas_global: 5
+  max_tentativas_minuto: 3
+  max_tentativas_hora: 2
+  max_tentativas_dia: 0
+  max_tentativas_mes: 0
+  max_tentativas_paid: 0
 
 # ==============================================================================
 # consulta_nif.py — consulta à API pública nif.pt
