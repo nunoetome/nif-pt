@@ -43,6 +43,7 @@ from pathlib import Path
 
 from config.config import get_config
 from Logging.logging_orchestrator import setup_logging
+from utils.run_id import ensure_run_id, extract_cli_run_id, generate_run_id, get_run_id, set_run_id
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,8 @@ CREATE TABLE IF NOT EXISTS {TABELA} (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     nif             INTEGER NOT NULL,
     dados           TEXT NOT NULL,
-    data_consulta   TEXT NOT NULL DEFAULT (datetime('now'))
+    data_consulta   TEXT NOT NULL DEFAULT (datetime('now')),
+    run_id          TEXT
 );
 """
 
@@ -97,6 +99,22 @@ def get_db() -> sqlite3.Connection:
         logger.warning("[sqlite] Falha PRAGMA WAL: %s", e)
     conn.executescript(SQL_DDL)
     logger.debug("[sqlite] DDL nif_pt executado (tabela=%s)", TABELA)
+    # migração idempotente para BDs antigas sem run_id
+    try:
+        cur = conn.execute(f"PRAGMA table_info({TABELA})")
+        cols = [r[1] for r in cur.fetchall()]
+        if "run_id" not in cols:
+            conn.execute(f"ALTER TABLE {TABELA} ADD COLUMN run_id TEXT")
+            conn.commit()
+            logger.info("[sqlite] Migração: coluna run_id adicionada a %s", TABELA)
+        # índice por run_id para queries por execução
+        try:
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{TABELA}_run_id ON {TABELA}(run_id)")
+            conn.commit()
+        except sqlite3.Error:
+            pass
+    except sqlite3.Error as me:
+        logger.debug("[sqlite] Migração run_id ignorada: %s", me)
     conn.commit()
     logger.debug("[sqlite] get_db() -> %.2fs", time.perf_counter() - t)
     return conn
@@ -136,6 +154,12 @@ def main():
     logger_main.info("=" * 49)
     t_app = time.perf_counter()
 
+    # run_id — CLI > payload JSON > novo (será resolvido após ler JSON)
+    cli_run_id = extract_cli_run_id()
+    if cli_run_id:
+        set_run_id(cli_run_id)
+        logger_main.info("[run] run_id (cli)=%s", cli_run_id)
+
     raw = sys.stdin.read()
     logger_main.debug("[io] stdin lido %d bytes", len(raw))
     if not raw.strip():
@@ -148,7 +172,7 @@ def main():
 
     try:
         resultado = json.loads(raw)
-        logger_main.debug("[io] JSON carregado nif=%s", resultado.get("nif"))
+        logger_main.debug("[io] JSON carregado nif=%s run_id=%s", resultado.get("nif"), resultado.get("run_id"))
     except json.JSONDecodeError as e:
         logger_main.error("[io] JSON inválido: %s (preview=%.80s)", e, raw[:80])
         logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
@@ -157,8 +181,34 @@ def main():
         logger_main.info("=" * 49)
         sys.exit(1)
 
+    # run_id — resolve CLI > JSON > geração (garante mesma execução tem mesmo id)
+    _run_id = ensure_run_id(cli_value=cli_run_id, payload_value=resultado.get("run_id"))
+    if not resultado.get("run_id"):
+        logger_main.warning("[run] run_id ausente no JSON — gerado novo %s", _run_id[:8])
+        resultado["run_id"] = _run_id
+    else:
+        logger_main.info("[run] run_id=%s (herdado do JSON)", _run_id)
+        set_run_id(_run_id)
+
+    # NIF ignorado por cache recente — não insere, apenas loga
+    if resultado.get("ignorado"):
+        logger_main.info("[cache] NIF %s ignorado (cache_recente) ultima=%s run_id=%s - skip INSERT", resultado.get("nif"), resultado.get("data_ultima_consulta"), _run_id[:8])
+        logger_main.info("-" * 49)
+        logger_main.info("| NIF ignorado - skip SQLite                         |")
+        logger_main.info("|---------------------------------------------|")
+        logger_main.info("| NIF         : %-30s |", str(resultado.get("nif")))
+        logger_main.info("| Ultima      : %-30s |", str(resultado.get("data_ultima_consulta") or "—")[:30])
+        logger_main.info("| run_id      : %-30s |", _run_id[:30])
+        logger_main.info("-" * 49)
+        logger_main.info("[run] run_id=%s", _run_id)
+        logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
+        logger_main.info("=" * 49)
+        logger_main.info(f"{' nif-pt importar_nif_sqlite finalizado ':=^49}")
+        logger_main.info("=" * 49)
+        sys.exit(0)
+
     if resultado.get("erro"):
-        logger_main.warning("[api] Erro consulta propagado: %s", resultado["erro"])
+        logger_main.warning("[api] Erro consulta propagado: %s run_id=%s", resultado["erro"], _run_id[:8])
         logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
         logger_main.info("=" * 49)
         logger_main.info(f"{' nif-pt importar_nif_sqlite finalizado ':=^49}")
@@ -181,14 +231,25 @@ def main():
 
     try:
         dados_json = json.dumps(resultado, ensure_ascii=False)
-        logger_main.debug("[sqlite] dados_json %d chars nif=%s", len(dados_json), nif)
+        logger_main.debug("[sqlite] dados_json %d chars nif=%s run_id=%s", len(dados_json), nif, _run_id[:8])
         t_insert = time.perf_counter()
-        cursor.execute(
-            f"INSERT INTO {TABELA} (nif, dados, data_consulta) VALUES (?, ?, ?)",
-            (nif, dados_json, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        )
+        # tenta com run_id; fallback sem coluna para BDs antigas
+        try:
+            cursor.execute(
+                f"INSERT INTO {TABELA} (nif, dados, data_consulta, run_id) VALUES (?, ?, ?, ?)",
+                (nif, dados_json, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), _run_id),
+            )
+        except sqlite3.OperationalError as oe:
+            if "run_id" in str(oe).lower():
+                logger_main.warning("[sqlite] Coluna run_id em falta — fallback sem run_id: %s", oe)
+                cursor.execute(
+                    f"INSERT INTO {TABELA} (nif, dados, data_consulta) VALUES (?, ?, ?)",
+                    (nif, dados_json, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                )
+            else:
+                raise
         conn.commit()
-        logger_main.info("[sqlite] INSERT %s nif=%s -> 1 row em %.2fs", TABELA, nif, time.perf_counter() - t_insert)
+        logger_main.info("[sqlite] INSERT %s nif=%s run_id=%s -> 1 row em %.2fs", TABELA, nif, _run_id[:8], time.perf_counter() - t_insert)
         # BOX sucesso
         logger_main.info("-" * 49)
         logger_main.info("| Guardado em SQLite                                |")
@@ -196,6 +257,7 @@ def main():
         logger_main.info("| NIF         : %-30s |", str(nif))
         logger_main.info("| Tabela      : %-30s |", TABELA)
         logger_main.info("| DB          : %-30s |", str(DB_PATH))
+        logger_main.info("| run_id      : %-30s |", _run_id[:30])
         logger_main.info("| Tempo       : %-30s |", f"{time.perf_counter() - t_app:.2f}s")
         logger_main.info("-" * 49)
     except sqlite3.Error as e:
@@ -212,6 +274,7 @@ def main():
         conn.close()
         logger_main.debug("[sqlite] Ligação fechada")
 
+    logger_main.info("[run] run_id=%s", _run_id)
     logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
     logger_main.info("=" * 49)
     logger_main.info(f"{' nif-pt importar_nif_sqlite finalizado ':=^49}")

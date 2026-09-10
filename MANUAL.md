@@ -1,9 +1,9 @@
-# Manual de Instruções — nif-pt v1.0.0
+# Manual de Instruções — nif-pt v1.2.0 (cache + run_id)
 
-> Ferramenta Python para consulta de NIFs portugueses via [nif.pt](http://www.nif.pt) (`?json=1`) com validação Mod-11, pipeline Unix e persistência SQLite WAL / Azure SQL + camada resiliente de rate-limit.
+> Ferramenta Python para consulta de NIFs portugueses via [nif.pt](http://www.nif.pt) (`?json=1`) com validação Mod-11, pipeline Unix e persistência SQLite WAL + validação cache (`nif_ignorados`) + camada resiliente de rate-limit + **rastreabilidade `run_id` (UUID v4) por execução**.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-v1.0.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v1.2.0-blue.svg)](CHANGELOG.md)
 
 ---
 
@@ -31,42 +31,47 @@
 
 ### 1.1 Objetivo e âmbito
 
-`nif-pt` consulta a base pública do portal `nif.pt` (`GET ?json=1&q=<NIF>&key=<KEY>`) e guarda o resultado localmente (SQLite WAL) e/ou remotamente (Azure SQL). Destina-se a pessoas coletivas com registo público; NIFs de pessoas singulares ou recentes podem devolver `No records found`.
+`nif-pt` consulta a base pública do portal `nif.pt` (`GET ?json=1&q=<NIF>&key=<KEY>`) e guarda o resultado localmente em SQLite WAL. Destina-se a pessoas coletivas com registo público; NIFs de pessoas singulares ou recentes podem devolver `No records found`.
 
-Novidade `v1.0.0`: camada `utils/error_handler.py` (612L) classifica erros de quota, persiste em `nif_api_erros` (dual SQLite/Azure) e aplica `retry 60s` (minuto) / `3600s` (hora) com limites `max_tentativas_global 5 / minuto 3 / hora 2 / dia 0 / mes 0`.
+Novidade `v1.0.0`: camada `utils/error_handler.py` (806L) classifica erros de quota, persiste em `nif_api_erros` (SQLite WAL, 15c com `run_id`) e aplica `retry 60s` (minuto) / `3600s` (hora) com limites `max_tentativas_global 5 / minuto 3 / hora 2 / dia 0 / mes 0`.
+Novidade `v1.1.0`: **rastreabilidade `run_id`** — `utils/run_id.py` (191L) `generate_run_id()` UUID v4 + `ContextVar` + `ensure_run_id(CLI>payload>ctx>gen)`, `consulta_nif.py:consultar_nif(nif, run_id)` inclui `run_id` em todos os JSON, `importar_nif_sqlite.py` persiste `run_id` (5c/15c) com `ALTER TABLE` idempotente + `INDEX run_id`, CLI `--run-id` determinístico.
+Novidade `v1.2.0`: **validação cache SQLite** — `utils/cache_validator.py` (407L) `is_nif_recente(nif, dias)` verifica `nif_pt` antes de API; se NIF consultado há < `cache_antiguidade_dias` (default 30d) → regista `nif_ignorados` 6c (`id, nif, data_tentativa, data_ultima_consulta, dias_desde_ultima, motivo='cache_recente'`) + `stdout` JSON `{ignorado:true, motivo:cache_recente, data_ultima_consulta, cache_antiguidade_dias}` + `sys.exit(0)` sem gastar créditos; `importar_nif_sqlite.py:194` faz early skip se `ignorado`; configuração `config/config.yaml:15` `cache_ativo/cache_antiguidade_dias/cache_tabela_ignorados`; TAG `[cache]` + `BOX NIF ignorado`.
 
 ### 1.2 Funcionalidades
 
 | ID | Funcionalidade | Estado | Ficheiro |
 |----|----------------|--------|----------|
-| RF-01 | Validar NIF Mod-11 | ✅ | `consulta_nif.py:48` `validar_nif()` |
-| RF-02 | Consultar `nif.pt` (`?json=1&q=&key=`, timeout 10s) | ✅ | `consulta_nif.py:113` `requests.get` |
-| RF-03 | JSON normalizado (`valido/fonte/erro/dados/creditos/tipo_erro`) | ✅ | `consulta_nif.py:257` |
-| RF-04 | Guardar JSON bruto SQLite WAL | ✅ | `importar_nif_sqlite.py:42` `get_db()` |
-| RF-05 | Normalizar 36 cols → Azure `nif_pt_stg` | ✅ | `importar_nif.py:103` `mapear_registo()` |
-| RF-06 | Pipeline `stdin/stdout` + `exit 0/1` | ✅ | `sys.stdin.read()` |
-| RF-07 | Camada `error_handler` (6 tipos, retry/abort, `nif_api_erros`) | ✅ | `utils/error_handler.py:346` `tratar_erro()` |
-| RF-08 | Logging R1-R9 `<<nif-pt>>` `RotatingFileHandler` 10MB/5000/10 | ✅ | `Logging/logging_orchestrator.py:226` |
+| RF-01 | Validar NIF Mod-11 | ✅ | `consulta_nif.py:99` `validar_nif()` |
+| RF-02 | Consultar `nif.pt` (`?json=1&q=&key=`, timeout 10s) | ✅ | `consulta_nif.py:272` `requests.get` |
+| RF-03 | JSON normalizado (`valido/fonte/erro/dados/creditos/tipo_erro/run_id`) + `ignorado/motivo/data_ultima_consulta/cache_antiguidade_dias` se cache | ✅ | `consulta_nif.py:237` + `:547` + `utils/cache_validator.py:225` |
+| RF-04 | Guardar JSON bruto SQLite WAL (5c com `run_id`) + early skip `ignorado` | ✅ | `importar_nif_sqlite.py:55` `get_db()` + `:194` |
+| RF-05 | Pipeline `stdin/stdout` + `exit 0/1` com `run_id` + `ignorado` | ✅ | `sys.stdin.read()` + `utils/run_id.py:132` `--run-id` + `utils/cache_validator.py:329` |
+| RF-06 | Camada `error_handler` (6 tipos, retry/abort, `nif_api_erros` 15c `run_id`) | ✅ | `utils/error_handler.py:515` `tratar_erro(...,run_id)` |
+| RF-07 | Validação cache `nif_ignorados` 6c (`is_nif_recente` + `registar_ignorado` + `init_cache_tables`) | ✅ | `utils/cache_validator.py:225` + `consulta_nif.py:529` |
+| RF-08 | Logging R1-R9 `<<nif-pt>>` `RotatingFileHandler` 10MB/5000/10 + TAG `[cache][run]` | ✅ | `Logging/logging_orchestrator.py:226` |
 | RF-09 | `help()` PEP 257 em todos os módulos | ✅ | `docs/api/help.md` |
+| RF-10 | Rastreabilidade `run_id` UUID v4 por execução + `nif_ignorados` cache | ✅ | `utils/run_id.py:41` + `utils/cache_validator.py:43` |
 
 ### 1.3 Requisitos não-funcionais
 
-* **Performance:** `timeout 10s` (`config.yaml:3`), `WAL`, `sleep 60s/3600s` em retry.
+* **Performance:** `timeout 10s` (`config.yaml:3`), `WAL`, `sleep 60s/3600s` em retry, índices `run_id` + `idx_nif_ignorados_*`, cache evita API para NIFs recentes.
 * **Segurança:** segredos só em `config/.env` (`.gitignore`), `NIF-PT-KEY` mascarada `***XXXX` em todos os logs.
-* **Portabilidade:** `pathlib`, `pyodbc` ODBC 18, dual PowerShell 5.1 / Bash.
-* **Observabilidade:** `log_files/nif_pt.log` com BOX `| NIF : ... |` + TAG `[api][valid][cfg][db][sqlite][io][map][erro][rate-limit]` + TIMING `%.2fs`.
+* **Portabilidade:** `pathlib`, só `sqlite3` stdlib (sem `pyodbc`/`ODBC`), dual PowerShell 5.1 / Bash, `ContextVar` para `run_id`.
+* **Observabilidade:** `log_files/nif_pt.log` com BOX `| NIF : ... |` + `| run_id : ... |` + `| Ultima : ... |` + TAG `[api][valid][cfg][db][sqlite][io][cache][erro][rate-limit][run]` + TIMING `%.2fs` + `run_id` em `nif_pt`/`nif_api_erros` + `nif_ignorados` com `motivo`.
 
 ### 1.4 Público-alvo e limitações
 
-Operações, compliance, data engineering. `nif.pt` é agregadora — pode estar desatualizada, com `rate-limit` (`creditos.left`) ou sem registo (`No records found` não indica NIF inválido).
+Operações, compliance, data engineering. `nif.pt` é agregadora — pode estar desatualizada, com `rate-limit` (`creditos.left`) ou sem registo (`No records found` não indica NIF inválido). Cache de 30d por defeito evita re-consulta dentro da janela; use `cache_ativo: false` ou `cache_antiguidade_dias: 0` para forçar refresh.
 
 ### 1.5 Histórico de versões
 
 | Versão | Data | Destaque |
 |--------|------|----------|
-| `v.0.1.0-alpha` | 2026-06-26 | Fundação `consulta_nif` + `importar_nif` + SQLite + DDL Azure |
+| `v.0.1.0-alpha` | 2026-06-26 | Fundação `consulta_nif` + SQLite + DDL |
 | `v0.2.0-beta` | 2026-06-26 | Config centralizada, SQLite JSON bruto, `MANUAL` 310L |
-| `v1.0.0` **(esta)** | 2026-09-10 | `error_handler` 612L + `nif_api_erros` dual + `logging_orchestrator` 580L + `timeout 10s` + `max_tentativas_*` + docs 15 caps |
+| `v1.0.0` | 2026-09-10 | `error_handler` 806L + `nif_api_erros` + `logging_orchestrator` 580L + `timeout 10s` + `max_tentativas_*` |
+| `v1.1.0` | 2026-09-11 | `run_id` UUID v4 191L + `consulta_nif(nif,run_id)` + `importar_nif_sqlite` 5c + `error_handler` 15c `run_id` + `--run-id` |
+| `v1.2.0` **(esta)** | 2026-09-10 | `cache_validator` 407L + `nif_ignorados` 6c + `is_nif_recente/registar_ignorado` + payload `ignorado` + early skip + `TAG [cache]` + remoção Azure/`pyodbc`/`sql/0*` |
 
 Ver [CHANGELOG.md](CHANGELOG.md) completo.
 
@@ -78,15 +83,18 @@ Ver [CHANGELOG.md](CHANGELOG.md) completo.
 
 ```mermaid
 graph LR
-    U[Utilizador<br/>NIF 9 dígitos] --> C[consulta_nif.py<br/>validar_nif + requests<br/>tratar_erro]
-    C -->|stdout JSON<br/>ensure_ascii=False| S[importar_nif_sqlite.py<br/>JSON bruto WAL]
-    C -->|stdout JSON| A[importar_nif.py<br/>36 cols pyodbc]
-    C -->|erro classificado| E[(nif_api_erros<br/>SQLite + Azure)]
-    S --> DB1[(data/nif_pt.db<br/>nif_pt 4c + nif_api_erros 14c<br/>PRAGMA WAL)]
-    A --> DB2[(Azure SQL<br/>stg_nunotome.nif_pt_stg 40c)]
-    DB2 -. MERGE futuro .-> DB3[(stg_nunotome.nif_pt 37c PK nif)]
-    CFG[config.yaml 37L + .env<br/>get_config merge] -.-> C & S & A & E
-    LOG[logging_orchestrator<br/>R1-R9 <<nif-pt>>] -.-> C & S & A & E
+    U[Utilizador<br/>NIF 9 dígitos --run-id] --> C[consulta_nif.py<br/>validar_nif + cache is_nif_recente<br/>+ requests + run_id UUID v4]
+    C -->|cache hit<br/>ignorado:true motivo:cache_recente| IG[(nif_ignorados<br/>6c cache_recente WAL)]
+    C -->|stdout JSON run_id<br/>ensure_ascii=False| S[importar_nif_sqlite.py<br/>JSON bruto WAL 5c<br/>early skip ignorado run_id]
+    C -->|erro classificado run_id| E[(nif_api_erros<br/>SQLite 15c run_id)]
+    C -->|cache miss| API[(nif.pt<br/>GET ?json=1&q=&key=)]
+    S --> DB[(data/nif_pt.db<br/>nif_pt 5c + nif_api_erros 15c<br/>+ nif_ignorados 6c<br/>PRAGMA WAL)]
+    IG --> DB
+    E --> DB
+    CV[utils/cache_validator.py<br/>DDL 6c 2 índices + is_nif_recente<br/>+ registar_ignorado] -. cache .-> C
+    R[utils/run_id.py<br/>generate_run_id + ContextVar<br/>ensure CLI>payload>ctx>gen] -. run_id .-> C & S & E
+    CFG[config.yaml 31L + .env<br/>get_config merge cache_*] -.-> C & S & E & CV
+    LOG[logging_orchestrator<br/>R1-R9 <<nif-pt>> [cache][run]] -.-> C & S & E & CV
 ```
 
 Fonte única: [docs/technical.md](docs/technical.md) + [docs/architecture/diagrams.md](docs/architecture/diagrams.md).
@@ -94,49 +102,152 @@ Fonte única: [docs/technical.md](docs/technical.md) + [docs/architecture/diagra
 ### 2.2 Pipeline `stdin`/`stdout`
 
 ```
-consulta_nif.py  ──JSON──>  importar_nif_sqlite.py  (SQLite WAL)
-                 ──JSON──>  importar_nif.py         (Azure SQL staging)
-                 ──erro──>  nif_api_erros           (auditoria)
+consulta_nif.py  ──JSON run_id──────────>  importar_nif_sqlite.py  (SQLite WAL 5c, INSERT)
+                 ──JSON ignorado:true──>  importar_nif_sqlite.py  (skip INSERT, BOX skip)
+                 ──erro run_id─────────>  nif_api_erros           (auditoria 15c)
+                 ──cache hit───────────>  nif_ignorados           (6c, sem API)
 ```
+Precedência `run_id`: `CLI --run-id` > `payload JSON run_id` > `ContextVar` > `uuid4` (`utils/run_id.py:87` `ensure_run_id()`); `main.py:60` `ensure_run_id()` por execução.
 
-* `consulta_nif.py` só JSON em `stdout` (`consulta_nif.py:318` `json.dumps(..., indent=2, ensure_ascii=False)`); humanos em `stderr` (`<<nif-pt>>`).
-* Importadores `sys.stdin.read()` → `json.loads` → `INSERT`; falham `exit 1` se `stdin` vazio ou `resultado.erro` existe (propagam erro sem inserir).
-* `nif_api_erros` persiste **sempre** antes de decidir `retry/abort` (ver §10).
+* `consulta_nif.py` só JSON em `stdout` (`consulta_nif.py:585` `json.dumps(..., indent=2, ensure_ascii=False)`) com campo `run_id` + opcional `ignorado/motivo/data_ultima_consulta/cache_antiguidade_dias`; humanos em `stderr` (`<<nif-pt>>` + `[cache][run]`).
+* Cache: `consulta_nif.py:529` `is_nif_recente(nif, dias=30)` se `cache_ativo==true`; se `recente==True` → `registar_ignorado(nif, data_ultima)` → `stdout` JSON `ignorado:true` + `BOX NIF ignorado - cache recente` + `sys.exit(0)` sem `requests.get`.
+* Importador `sys.stdin.read()` → `json.loads` → `ensure_run_id(CLI>payload>ctx>gen)` (`importar_nif_sqlite.py:185`) → `if ignorado: INFO [cache] skip + BOX skip + exit 0` else `if erro: exit 1` else `INSERT (nif,dados,data_consulta,run_id)`; `nif_api_erros` persiste **sempre** antes de decidir `retry/abort` com `run_id` (`utils/error_handler.py:368`).
+* `nif_ignorados` persiste tentativas ignoradas com `data_tentativa DEFAULT datetime('now')` + `dias_desde_ultima` calculado.
 
 ### 2.3 Centralização de configuração
 
-`config/config.py:30` `get_config(script_name)`:
+`config/config.py:53` `get_config(script_name)`:
 
-1. `default` (`config.yaml:1` — 11 chaves `retry_count`, `timeout 10`, `tempo_*`, `max_tentativas_*`)
-2. Bloco do script (`consulta_nif` / `importar_nif_sqlite` / `importar_nif`)
-3. `.env` (`NIF-PT-KEY` com hífen, `AZURE_USER`, `AZURE_PALAVRA_CHAVE`, `API_TOKEN`)
+1. `default` (`config.yaml:1` — 14 chaves `retry_count`, `timeout 10`, `tempo_*`, `max_tentativas_*`, `cache_*`)
+2. Bloco do script (`consulta_nif` / `importar_nif_sqlite`)
+3. `.env` (`NIF-PT-KEY` com hífen, `API_TOKEN`)
 
 ```python
 cfg = get_config("consulta_nif")
 API_BASE = cfg.get("api_base", "http://www.nif.pt")
 API_KEY  = cfg.get("NIF_PT_KEY")  # os.getenv("NIF-PT-KEY")
 TIMEOUT  = cfg.get("timeout", 10)
+CACHE_ATIVO = cfg.get("cache_ativo", True)
+CACHE_DIAS  = cfg.get("cache_antiguidade_dias", 30)
 MAX_GLOBAL = cfg.get("max_tentativas_global", 5)
 ```
 
-### 2.4 Camada de erros (v1.0.0)
+### 2.4a Rastreabilidade `run_id` (v1.1.0)
 
-`utils/error_handler.py` (612L):
+`utils/run_id.py` (191L):
+
+| Função | Linha | Descrição |
+|--------|-------|-----------|
+| `generate_run_id()` | `:41` | `str(uuid.uuid4())` — 36 chars, 4 hífens, `logger.debug [run]` |
+| `set_run_id` / `get_run_id` | `:59` / `:78` | `ContextVar[str|None] _run_id_ctx` thread-safe |
+| `ensure_run_id(cli_value, payload_value)` | `:87` | Precedência `CLI > payload > ContextVar > geração` + `set_run_id` |
+| `extract_cli_run_id(argv)` | `:132` | Parse `--run-id UUID` e `--run-id=UUID` sem `argparse` |
+| `remove_run_id_args(argv)` | `:163` | Cópia `argv` sem `--run-id` para `isdigit` posicional |
+
+**Fluxo por script:**
+
+* `consulta_nif.py:481` `main()` → `cli_run_id=extract_cli_run_id()` → `_run_id=ensure_run_id(cli_value)` → `logger_main.info("[run] run_id=%s", _run_id)` → `is_nif_recente` / `consultar_nif(nif, run_id=_run_id)` (`:237` resolve `run_id or get_run_id() or generate_run_id()` e inclui `run_id` em todos os `return`).
+* `importar_nif_sqlite.py:158` → `cli_run_id=extract_cli_run_id()` → `if cli_run_id: set_run_id(...)` → após `json.loads` → `ensure_run_id(cli_value, payload_value=resultado.get("run_id"))` → `if ignorado: skip` else `INSERT (...,run_id)` + fallback se coluna falta (`:238`).
+* `utils/error_handler.py:368` `guardar_erro(...,run_id)` + `:515` `tratar_erro(...,run_id)` — propagam `run_id` (ou `get_run_id()` se `None`) para `nif_api_erros` 15c.
+* `main.py:60` `ensure_run_id(cli_value=extract_cli_run_id())` por execução.
+
+**Persistência:** DDL `run_id TEXT` + `CREATE INDEX ...run_id` + migração idempotente (`PRAGMA table_info` + `ALTER TABLE ADD COLUMN`) — ver §7.4.
+
+### 2.4b Validação cache (v1.2.0) — `utils/cache_validator.py` 407L
+
+| Função | Linha | Descrição |
+|--------|-------|-----------|
+| `is_nif_recente(nif, dias)` | `:225` | `SELECT data_consulta FROM nif_pt WHERE nif=? ORDER BY datetime(data_consulta) DESC LIMIT 1` + `_parse_data_consulta` (YYYY-MM-DD HH:MM:SS/ISO/Z) + `total_seconds/86400 < dias` + `INFO [cache] recente=True/False (%.2fs)`; fail-open `(False,None)` se erro BD |
+| `registar_ignorado(nif, data_ultima, motivo="cache_recente")` | `:329` | `INSERT nif_ignorados (nif, data_ultima_consulta, dias_desde_ultima, motivo)` + `dias_desde = (now - data_ultima).days` + `INFO [cache] Ignorado registado id=...` |
+| `init_cache_tables()` | `:163` | DDL `nif_ignorados` 6c + 2 índices WAL idempotente (chamado `consulta_nif.py:536`) |
+| `_get_cache_config()` | `:101` | Lê `cache_ativo`, `cache_antiguidade_dias`, `cache_tabela_ignorados` (sanitizado `alnum+_`) do YAML |
+| `_parse_data_consulta(val)` | `:188` | Converte `YYYY-MM-DD HH:MM:SS` / `ISO` / `Z` → `datetime` |
+| `_get_connection()` | `:126` | `PRAGMA WAL` + `executescript(DDL_IGNORADOS)` + 2 índices + sanitiza nome tabela |
+
+**DDL `nif_ignorados` 6c (`utils/cache_validator.py:43`):**
+
+```sql
+CREATE TABLE IF NOT EXISTS nif_ignorados (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    nif                     INTEGER NOT NULL,
+    data_tentativa          TEXT NOT NULL DEFAULT (datetime('now')),
+    data_ultima_consulta    TEXT,
+    dias_desde_ultima       INTEGER,
+    motivo                  TEXT NOT NULL DEFAULT 'cache_recente'
+);
+CREATE INDEX IF NOT EXISTS idx_nif_ignorados_nif ON nif_ignorados(nif);
+CREATE INDEX IF NOT EXISTS idx_nif_ignorados_data ON nif_ignorados(data_tentativa);
+```
+
+**Fluxo `consulta_nif.py:529` `main()` (antes de API):**
+
+```python
+cache_ativo, cache_dias, _ = _get_cache_config()
+if cache_ativo:
+    init_cache_tables()  # fail-open
+    recente, data_ultima = is_nif_recente(nif, dias=cache_dias)  # fail-open False,None
+    if recente:
+        registar_ignorado(nif, data_ultima)  # fail-open warning
+        payload = {"nif": nif, "valido": ..., "fonte": None, "erro": None,
+                   "ignorado": True, "motivo": "cache_recente",
+                   "data_ultima_consulta": data_ultima, "cache_antiguidade_dias": cache_dias,
+                   "run_id": _run_id}
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        # BOX NIF ignorado - cache recente + sys.exit(0) sem requests.get
+```
+
+**Payload `ignorado` → `importar_nif_sqlite.py:194`:**
+
+```python
+if resultado.get("ignorado"):
+    logger.info("[cache] NIF %s ignorado (cache_recente) ultima=%s run_id=%s - skip INSERT", ...)
+    # BOX NIF ignorado - skip SQLite + sys.exit(0) sem INSERT
+```
+
+**Exemplo:**
+
+```powershell
+# 1ª consulta — cache miss, vai à API
+python consulta_nif.py 509442013 | python importar_nif_sqlite.py
+# log: [cache] NIF 509442013 ... recente=False -> GET -> INSERT -> nif_ignorados vazio
+
+# 2ª consulta em <30d — cache hit, sem API
+python consulta_nif.py 509442013
+# stdout: {"nif":"509442013","ignorado":true,"motivo":"cache_recente","data_ultima_consulta":"2026-09-10 12:00:00","cache_antiguidade_dias":30,"run_id":"..."}
+# stderr: [cache] NIF 509442013 ignorado - ultima consulta 2026-09-10 12:00:00 dentro de 30 dias
+#         | NIF ignorado - cache recente | + run_id + sys.exit(0)
+# sqlite: SELECT * FROM nif_ignorados WHERE nif=509442013;
+
+# Pipe com ignorado — skip INSERT
+python consulta_nif.py 509442013 | python importar_nif_sqlite.py
+# stderr: [cache] NIF 509442013 ignorado (cache_recente) ultima=... - skip INSERT
+#         | NIF ignorado - skip SQLite | + sys.exit(0)
+
+# Forçar refresh — desligar cache ou dias=0
+# config.yaml: cache_ativo: false  ou  cache_antiguidade_dias: 0
+# ou: sqlite3 data/nif_pt.db "DELETE FROM nif_ignorados WHERE nif=509442013; DELETE FROM nif_pt WHERE nif=509442013;"
+```
+
+Ver `docs/technical.md` §10c e `docs/database/schema.md` §4 (`nif_ignorados` 6c).
+
+### 2.4c Camada de erros (v1.0.0 + run_id)
+
+`utils/error_handler.py` (806L):
 
 * `classificar_erro(data)` → `rate_limit_minute/hour/day/month/paid` / `generic_error` / `unknown` (mensagem `Limit per ...` + `credits.left` com `0`).
-* `tratar_erro(nif, data, tentativas_por_tipo, tentativa_global)` → `{tipo, acao: retry|abort|none, espera: 60|3600|0, deve_retry, max_tipo, max_global}` com lógica `deve_retry = tenta_tipo < max_tipo && tenta_global < max_global`.
-* `guardar_erro(...)` → `INSERT nif_api_erros` (14 cols, WAL) sempre.
-* `init_error_table()` idempotente no arranque de `consulta_nif.py:281`.
+* `tratar_erro(nif, data, tentativas_por_tipo, tentativa_global, run_id)` → `{tipo, acao: retry|abort|none, espera: 60|3600|0, deve_retry, max_tipo, max_global}` com lógica `deve_retry = tenta_tipo < max_tipo && tenta_global < max_global`.
+* `guardar_erro(...,run_id)` → `INSERT nif_api_erros` (15c, WAL) sempre.
+* `init_error_table()` idempotente no arranque de `consulta_nif.py:486` (antes de cache).
 * `get_tempo_espera()` / `get_max_tentativas()` lidos do `config.yaml`.
 
-Fluxo `consulta_nif.py:84` `consultar_nif()`:
+Fluxo `consulta_nif.py:171` `consultar_nif()`:
 
 ```
 for tentativa_global in range(max_global+1):
     try: requests.get(...)
     except Timeout/RequestException: sleep 60s retry se <max_global
-    if result != "success": tratar_erro() -> if retry: sleep 60s/3600s continue
-                                          -> if abort: return erro+tipo_erro
+    if result != "success": tratar_erro(...,run_id) -> if retry: sleep 60s/3600s continue
+                                          -> if abort: return erro+tipo_erro+run_id
     else: return sucesso
 ```
 
@@ -146,12 +257,13 @@ Ver [docs/technical.md §10](docs/technical.md#10-camada-de-erros).
 
 | ADR | Decisão | Justificação |
 |-----|---------|--------------|
-| ADR-001 | SQLite JSON bruto vs Azure 36 cols | WAL schemaless vs analítico |
-| ADR-002 | `WAL` | Mitiga `database is locked` |
-| ADR-003 | `ODBC 18` + `Encrypt=yes` | Exigido Azure |
-| ADR-007 | `error_handler` + `nif_api_erros` dual | Auditoria + retry `60s/3600s` vs abort |
+| ADR-001 | SQLite JSON bruto único (3 tabelas WAL) | Sem Azure; `sqlite3` stdlib, 3 deps |
+| ADR-002 | `WAL` em `nif_pt` + `nif_api_erros` + `nif_ignorados` | Mitiga `database is locked` |
+| ADR-007 | `error_handler` + `nif_api_erros` 15c `run_id` | Auditoria + retry `60s/3600s` vs abort + rastreabilidade |
+| ADR-009 | `run_id` UUID v4 + `ContextVar` + `ensure_run_id` | `CLI>payload>ctx>gen`, `--run-id` replay, índices `run_id` |
+| ADR-010 | Cache `nif_ignorados` 6c + `is_nif_recente` + `registar_ignorado` + payload `ignorado` + early skip | Evita créditos para NIFs recentes (30d), audita com 2 índices, fail-open, `TAG [cache]` |
 
-Ver [docs/technical.md §12](docs/technical.md#12-adrs) e [docs/architecture/architecture.md](docs/architecture/architecture.md).
+Ver [docs/technical.md §12](docs/technical.md#12-adrs) e [docs/architecture/architecture.md](docs/architecture/architecture.md) (10 ADRs).
 
 ---
 
@@ -165,21 +277,15 @@ Ver [docs/technical.md §12](docs/technical.md#12-adrs) e [docs/architecture/arc
 | `requests` | `>=2.31.0` | `pip install -r requirements.txt` | ✅ |
 | `pyyaml` | `>=6.0.1` | idem | ✅ |
 | `python-dotenv` | `>=1.0.0` | idem | ✅ |
-| `pyodbc` | `>=5.0.0` | idem | Só Azure |
-| `ODBC Driver 18` | 18.x | https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server | Só Azure |
 | Chave `nif.pt` | — | http://www.nif.pt/contactos/api/ | ✅ |
+| `sqlite3` | stdlib | — | ✅ |
+
+> Sem `pyodbc`, sem `ODBC Driver 18`, sem Azure.
 
 ### 3.2 Chave `NIF-PT-KEY`
 
 1. Solicitar em http://www.nif.pt/contactos/api/ (1-2 dias por email).
-2. `config/.env` → `NIF-PT-KEY=xxxxx` **com hífen** (`config/config.py:55` `os.getenv("NIF-PT-KEY")`).
-
-### 3.3 Azure SQL (opcional)
-
-* `kiwa-pt-operations.database.windows.net` / `kiwa-pt-operations` / `stg_nunotome` (`config.yaml:33`).
-* Whitelist IP no Portal Azure → SQL → Networking.
-* Verificar driver: `Get-OdbcDriver` (PS) ou `odbcinst -q -d` (Linux).
-* Aplicar `sql/01_criar_tabelas.sql` (37c+40c) e `sql/02_criar_tabela_erros.sql` (14c) via SSMS/Azure Data Studio/`sqlcmd`.
+2. `config/.env` → `NIF-PT-KEY=xxxxx` **com hífen** (`config/config.py:120` `os.getenv("NIF-PT-KEY")`).
 
 ---
 
@@ -190,7 +296,7 @@ Ver [docs/technical.md §12](docs/technical.md#12-adrs) e [docs/architecture/arc
 ```bash
 git clone https://github.com/nunoetome/nif-pt.git
 cd nif-pt
-git checkout v1.0.0   # stable; dev para desenvolvimento
+git checkout v1.2.0   # stable; dev para desenvolvimento
 ```
 
 ### 4.2 Criar `venv`
@@ -222,7 +328,6 @@ pip install -r requirements.txt
 # requests>=2.31.0
 # pyyaml>=6.0.1
 # python-dotenv>=1.0.0
-# pyodbc>=5.0.0
 ```
 
 ### 4.4 Verificar
@@ -230,15 +335,18 @@ pip install -r requirements.txt
 ```bash
 python -c "from config.config import get_config; print(get_config('consulta_nif').keys())"
 python -c "import consulta_nif; help(consulta_nif.validar_nif)"
-python -c "from utils.error_handler import tratar_erro; help(tratar_erro)"
+python -c "from utils.cache_validator import is_nif_recente; help(is_nif_recente)"
+python -c "from utils.cache_validator import init_cache_tables; init_cache_tables(); print('nif_ignorados OK')"
 python consulta_nif.py 509442013  # requer NIF-PT-KEY
+python consulta_nif.py 509442013 | python importar_nif_sqlite.py
+python consulta_nif.py 509442013  # 2ª vez -> ignorado:true se <30d
 ```
 
 ---
 
 ## 5. Configuração
 
-### 5.1 `config/config.yaml` (37L)
+### 5.1 `config/config.yaml` (31L)
 
 ```yaml
 default:
@@ -253,28 +361,28 @@ default:
   max_tentativas_dia: 0
   max_tentativas_mes: 0
   max_tentativas_paid: 0
+  cache_ativo: true
+  cache_antiguidade_dias: 30
+  cache_tabela_ignorados: "nif_ignorados"
 consulta_nif:
   api_base: "http://www.nif.pt"
 importar_nif_sqlite:
   db_path: "data/nif_pt.db"
   tabela: "nif_pt"
-importar_nif:
-  sql_server: "kiwa-pt-operations.database.windows.net"
-  sql_database: "kiwa-pt-operations"
-  sql_schema: "stg_nunotome"
-  sql_driver: "ODBC Driver 18 for SQL Server"
-  tabela_staging: "nif_pt_stg"
 ```
 
 | Chave | Onde usada | Descrição |
 |-------|------------|-----------|
-| `timeout` | `consulta_nif.py:28` `requests.get(timeout=10)` | segundos (10s, não 1000) |
-| `tempo_de_espera` | `consulta_nif.py:129` | retry rede/Timeout genérico 60s |
-| `tempo_espera_minuto/hora` | `utils/error_handler.py:215` `get_tempo_espera()` | 60s / 3600s por janela rate-limit |
-| `max_tentativas_global` | `consulta_nif.py:35` `MAX_TENTATIVAS_GLOBAL` | limite total (5) |
-| `max_tentativas_minuto/hora/dia/mes` | `utils/error_handler.py:226` | 3 / 2 / 0 / 0 (0=abort) |
-| `api_base` | `consulta_nif.py:26` | `http://www.nif.pt` |
-| `db_path` | `importar_nif_sqlite.py:29` | `data/nif_pt.db` |
+| `timeout` | `consulta_nif.py:79` `requests.get(timeout=10)` | segundos (10s) |
+| `tempo_de_espera` | `consulta_nif.py:81` | retry rede/Timeout genérico 60s |
+| `tempo_espera_minuto/hora` | `utils/error_handler.py:272` `get_tempo_espera()` | 60s / 3600s por janela rate-limit |
+| `max_tentativas_global` | `consulta_nif.py:86` `MAX_TENTATIVAS_GLOBAL` | limite total (5) |
+| `max_tentativas_minuto/hora/dia/mes` | `utils/error_handler.py:296` | 3 / 2 / 0 / 0 (0=abort) |
+| `cache_ativo` | `consulta_nif.py:532` + `utils/cache_validator.py:113` | `true` liga cache antes de API |
+| `cache_antiguidade_dias` | `consulta_nif.py:539` `is_nif_recente(nif, dias)` | janela dias (30); `<=0` desliga |
+| `cache_tabela_ignorados` | `utils/cache_validator.py:119` | nome tabela ignorados (sanitizado) |
+| `api_base` | `consulta_nif.py:77` | `http://www.nif.pt` |
+| `db_path` | `importar_nif_sqlite.py:52` | `data/nif_pt.db` |
 
 ### 5.2 `config/.env` (+ `.env.example`)
 
@@ -282,20 +390,16 @@ importar_nif:
 # NIF-PT — http://www.nif.pt/contactos/api/
 NIF-PT-KEY=coloque_aqui
 
-# Azure SQL — portal.azure.com → Connection strings
-AZURE_USER=seu_user
-AZURE_PALAVRA_CHAVE=sua_password
-
 # Opcional futuro
 # API_TOKEN=...
 ```
 
 * `Copy-Item config\.env.example config\.env` e editar — **nunca** commitar (`.gitignore`).
-* Nome **exato** `NIF-PT-KEY` com hífen — `NIF_PT_KEY` não é lido (`config.py:55`).
+* Nome **exato** `NIF-PT-KEY` com hífen — `NIF_PT_KEY` não é lido (`config.py:120`).
 
 ### 5.3 Precedência
 
-`default` < bloco do script < `.env` — `config.py:45` `config.update(script_config)` (shallow merge).
+`default` < bloco do script < `.env` — `config.py:115` `config.update(script_config)` (shallow merge).
 
 ---
 
@@ -305,69 +409,39 @@ AZURE_PALAVRA_CHAVE=sua_password
 
 ```powershell
 python consulta_nif.py 509442013
+python consulta_nif.py 509442013 --run-id 550e8400-e29b-41d4-a716-446655440000  # replay determinístico
 ```
 
-* Valida `isdigit` + `validar_nif()` Mod-11 (`consulta_nif.py:48`) — log `WARN` se falha mas **não bloqueia** request.
-* Se `NIF-PT-KEY` falta → `{"erro":"NIF-PT-KEY não encontrada"}` + `exit 1` (`consulta_nif.py:88`).
-* Senão `GET http://www.nif.pt/?json=1&q=<NIF>&key=<KEY>` com `timeout 10s` e loop `max_global+1` com `tratar_erro()`.
+* Valida `isdigit` + `validar_nif()` Mod-11 (`consulta_nif.py:99`) — log `WARN` se falha mas **não bloqueia** cache/API.
+* `run_id` gerado em `consulta_nif.py:481` `ensure_run_id(cli_value=extract_cli_run_id())`; `run_id` incluído em **todos** os JSON (`consultar_nif(nif, run_id)` `consulta_nif.py:237` + cache `ignorado`), log `[run] run_id=...` e `BOX | run_id |`.
+* Se `NIF-PT-KEY` falta → `{"erro":"NIF-PT-KEY não encontrada","run_id":"..."} ` + `exit 1` (`consulta_nif.py:248`).
+* Senão verifica cache: `cache_ativo==true` → `init_cache_tables()` → `is_nif_recente(nif, dias=30)`; se `recente==True` → `registar_ignorado(nif, data_ultima)` → JSON `{ignorado:true, motivo:cache_recente, data_ultima_consulta, cache_antiguidade_dias, run_id}` + `BOX NIF ignorado - cache recente` + `exit 0` **sem** `GET`.
+* Senão `GET http://www.nif.pt/?json=1&q=<NIF>&key=<KEY>` com `timeout 10s` e loop `max_global+1` com `tratar_erro(...,run_id)` + `guardar_erro(...,run_id)`.
 
 ### 6.2 Modo 2 — SQLite local
 
 ```powershell
 python consulta_nif.py 509442013 | python importar_nif_sqlite.py
-# stderr: <<nif-pt>> INFO - [sqlite] INSERT nif_pt nif=509442013 -> 1 row em 0.02s
-#         | Guardado em SQLite |
+python consulta_nif.py 509442013 --run-id 550e8400-e29b-41d4-a716-446655440000 | python importar_nif_sqlite.py --run-id 550e8400-e29b-41d4-a716-446655440000
+# se cache miss:
+# stderr: [sqlite] INSERT nif_pt nif=509442013 run_id=550e8400 -> 1 row em 0.02s
+#         | Guardado em SQLite | + run_id
+# se cache hit (ignorado):
+# stderr: [cache] NIF 509442013 ignorado (cache_recente) ultima=... run_id=550e8400 - skip INSERT
+#         | NIF ignorado - skip SQLite |
 ```
 
-* `get_db()` cria `data/nif_pt.db` + `nif_pt` (`CREATE TABLE IF NOT EXISTS`, `PRAGMA WAL`) e `nif_api_erros` via `init_error_table()`.
-* `INSERT (nif, dados=JSON completo, data_consulta=datetime.now())`.
+* `get_db()` cria `data/nif_pt.db` + `nif_pt` (`CREATE TABLE IF NOT EXISTS` 5c `run_id TEXT`, `PRAGMA WAL`) + `idx_nif_pt_run_id` e `nif_api_erros`/`nif_ignorados` via `init_*_tables()`; migração idempotente `ALTER TABLE ADD COLUMN run_id TEXT`.
+* `INSERT (nif, dados=JSON completo, data_consulta=datetime.now(), run_id)` (`importar_nif_sqlite.py:238`) herdado do JSON via `ensure_run_id(CLI>payload>ctx>gen)` (`:185`) com fallback se coluna falta; se `resultado.get("ignorado")==True` → skip INSERT + `exit 0` (audita só `nif_ignorados`).
 
-### 6.3 Modo 3 — Azure SQL
-
-```powershell
-python consulta_nif.py 509442013 | python importar_nif.py
-# stderr: [db] INSERT stg_nunotome.nif_pt_stg nif=509442013 -> 1 row
-#         | Inserido em Azure SQL |
-```
-
-* Pré: ODBC 18, `AZURE_USER/PALAVRA_CHAVE`, tabelas criadas via `sql/01_criar_tabelas.sql` + `sql/02_criar_tabela_erros.sql`.
-* `mapear_registo()` 36 cols → `INSERT` parametrizado `?` com `commit/rollback`.
-
-### 6.4 Modo 4 — Ambos em simultâneo
-
-**PowerShell (correção — `tee >( )` não existe):**
-
-```powershell
-$json = python consulta_nif.py 509442013
-$json | python importar_nif_sqlite.py
-$json | python importar_nif.py
-# ou:
-python consulta_nif.py 509442013 | Tee-Object -FilePath temp.json | python importar_nif.py
-python importar_nif_sqlite.py < temp.json
-```
-
-**Bash (WSL/Git Bash):**
-
-```bash
-python consulta_nif.py 509442013 | tee >(python importar_nif_sqlite.py) | python importar_nif.py
-```
-
-### 6.5 Modo 5 — Ficheiro intermédio
-
-```powershell
-python consulta_nif.py 509442013 > resultado.json
-python importar_nif_sqlite.py < resultado.json
-python importar_nif.py < resultado.json
-```
-
-### 6.6 Batch (múltiplos NIFs)
+### 6.3 Modo 3 — Batch (múltiplos NIFs) + cache
 
 **PowerShell:**
 
 ```powershell
 Get-Content nifs.txt | ForEach-Object {
     python consulta_nif.py $_ | python importar_nif_sqlite.py
-    Start-Sleep -Seconds 1  # respeitar rate-limit minuto
+    Start-Sleep -Seconds 1  # respeitar rate-limit minuto; cache evita re-pedido <30d
 }
 ```
 
@@ -380,16 +454,62 @@ while read nif; do
 done < nifs.txt
 ```
 
-### 6.7 Help Python (v1.0.0)
+Cache evita API para NIFs já em `nif_pt` há <30d; `nif_ignorados` regista tentativas ignoradas.
+
+### 6.4 Modo 4 — Forçar refresh (ignorar cache)
+
+```powershell
+# Opção 1: desligar temporariamente via config
+# config.yaml -> cache_ativo: false  ou  cache_antiguidade_dias: 0
+python consulta_nif.py 509442013 | python importar_nif_sqlite.py
+
+# Opção 2: apagar histórico (local dev)
+# sqlite3 data/nif_pt.db "DELETE FROM nif_ignorados WHERE nif=509442013;"
+# sqlite3 data/nif_pt.db "DELETE FROM nif_pt WHERE nif=509442013;"
+
+# Opção 3: janela curta
+# config.yaml -> cache_antiguidade_dias: 1  (só considera recente se <1 dia)
+```
+
+### 6.5 Modo 5 — Ficheiro intermédio
+
+```powershell
+python consulta_nif.py 509442013 > resultado.json
+# se ignorado: resultado.json tem {"ignorado": true, ...} -> importar faz skip
+python importar_nif_sqlite.py < resultado.json
+```
+
+### 6.6 Modo 6 — Pipe e `tee` (PowerShell vs Bash)
+
+**PowerShell (correção — `tee >( )` não existe):**
+
+```powershell
+$json = python consulta_nif.py 509442013          # inclui run_id + ignorado se cache
+$json | python importar_nif_sqlite.py             # herda run_id; skip se ignorado
+# ou determinístico:
+$rid = "550e8400-e29b-41d4-a716-446655440000"
+$json = python consulta_nif.py 509442013 --run-id $rid
+$json | python importar_nif_sqlite.py             # mesmo $rid
+# ou ficheiro:
+python consulta_nif.py 509442013 | Tee-Object -FilePath temp.json | python importar_nif_sqlite.py
+```
+
+**Bash (WSL/Git Bash):**
+
+```bash
+python consulta_nif.py 509442013 | tee resultado.json | python importar_nif_sqlite.py
+```
+
+### 6.7 Help Python (v1.2.0)
 
 ```powershell
 python -c "import consulta_nif; help(consulta_nif.validar_nif)"
 python -c "import consulta_nif; help(consulta_nif.consultar_nif)"
+python -c "from utils.cache_validator import is_nif_recente, registar_ignorado; help(is_nif_recente)"
 python -c "from utils.error_handler import classificar_erro, tratar_erro; help(tratar_erro)"
 python -c "from config.config import get_config; help(get_config)"
-python -c "import importar_nif; help(importar_nif.mapear_registo)"
 python -m pydoc consulta_nif
-python -m pydoc utils.error_handler
+python -m pydoc utils.cache_validator
 ```
 
 Ver `docs/api/help.md` — transcrições verificadas.
@@ -398,29 +518,35 @@ Ver `docs/api/help.md` — transcrições verificadas.
 
 ## 7. Esquemas de Base de Dados
 
-### 7.1 Visão comparativa
+### 7.1 Visão comparativa v1.2.0
 
-| Aspeto | SQLite `nif_pt` | SQLite `nif_api_erros` | Azure `nif_pt` | Azure `nif_pt_stg` | Azure `nif_api_erros` |
-|--------|-----------------|------------------------|----------------|--------------------|-----------------------|
-| Ficheiro | `data/nif_pt.db` | `data/nif_pt.db` | `kiwa-pt-operations` | idem | idem |
-| Cols | 4 | 14 | 37 | 40 | 14 |
-| PK | `id AUTOINCREMENT` | `id AUTOINCREMENT` | `nif` | `id IDENTITY` | `id IDENTITY` |
-| Histórico | Sim | Sim | Não (ouro) | Sim (`processado`) | Sim (`resolvido`) |
-| DDL | `importar_nif_sqlite.py:32` | `utils/error_handler.py:46` | `sql/01_criar_tabelas.sql:21` | `sql/01_criar_tabelas.sql:93` | `sql/02_criar_tabela_erros.sql:20` |
-| Estratégia | JSON bruto | Auditoria | 36 cols norm. | Staging + merge | Auditoria |
+| Aspeto | `nif_pt` 5c | `nif_api_erros` 15c | `nif_ignorados` 6c |
+|--------|-------------|---------------------|-------------------|
+| Ficheiro | `data/nif_pt.db` SQLite WAL | `data/nif_pt.db` | `data/nif_pt.db` |
+| Cols | 5 (`id, nif, dados, data_consulta, run_id`) | 15 (14 + `run_id`) | 6 (`id, nif, data_tentativa, data_ultima_consulta, dias_desde_ultima, motivo`) |
+| PK | `id AUTOINCREMENT` | `id AUTOINCREMENT` | `id AUTOINCREMENT` |
+| Histórico | Sim (sem `UNIQUE nif`) | Sim (`resolvido`) | Sim |
+| DDL | `importar_nif_sqlite.py:55` | `utils/error_handler.py:46` | `utils/cache_validator.py:43` |
+| Índices | `idx_nif_pt_run_id` | `idx_nif_api_erros_*` + `idx_run_id` | `idx_nif_ignorados_nif` + `idx_nif_ignorados_data` |
+| Uso | JSON bruto + `run_id` | Auditoria `rate_limit_*` + `run_id` | Cache `is_nif_recente` + `registar_ignorado` |
 
-### 7.2 SQLite — `nif_pt` (4 cols)
+> Sem Azure desde v1.2.0 (removido `pyodbc`, `ODBC Driver 18`, `kiwa-pt-operations/stg_nunotome`, `sql/0*`).
+
+### 7.2 SQLite — `nif_pt` (5c: 4+`run_id`)
 
 ```sql
 CREATE TABLE IF NOT EXISTS nif_pt (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     nif           INTEGER NOT NULL,
-    dados         TEXT NOT NULL,          -- json.dumps(resultado, ensure_ascii=False)
-    data_consulta TEXT NOT NULL DEFAULT (datetime('now'))
+    dados         TEXT NOT NULL,          -- json.dumps(resultado, ensure_ascii=False) inclui run_id
+    data_consulta TEXT NOT NULL DEFAULT (datetime('now')),
+    run_id        TEXT                    -- UUID v4 da execução (utils/run_id.py:41)
 );
+CREATE INDEX IF NOT EXISTS idx_nif_pt_run_id ON nif_pt(run_id);
+-- Migração idempotente (importar_nif_sqlite.py:102): PRAGMA table_info -> ALTER TABLE ADD COLUMN run_id TEXT
 ```
 
-### 7.3 SQLite/Azure — `nif_api_erros` (14 cols)
+### 7.3 SQLite — `nif_api_erros` (15c: 14+`run_id`)
 
 ```sql
 -- SQLite (utils/error_handler.py:46)
@@ -435,48 +561,44 @@ CREATE TABLE IF NOT EXISTS nif_api_erros (
     left_minute   INTEGER, left_paid INTEGER,
     dados_json    TEXT NOT NULL,          -- JSON completo
     acao          TEXT,                   -- retry_60s / abort_day / none
+    run_id        TEXT,                   -- UUID v4 da execução (utils/run_id.py:41)
     resolvido     INTEGER NOT NULL DEFAULT 0
 );
--- Índices: idx_nif_api_erros_nif, idx_nif_api_erros_tipo
+-- Índices: idx_nif_api_erros_nif, idx_nif_api_erros_tipo, idx_nif_api_erros_run_id
+-- Migração idempotente (utils/error_handler.py:153): PRAGMA table_info -> ALTER TABLE ADD COLUMN run_id TEXT
 ```
+
+### 7.4 SQLite — `nif_ignorados` (6c) — novo v1.2.0
 
 ```sql
--- Azure SQL (sql/02_criar_tabela_erros.sql:20)
-CREATE TABLE stg_nunotome.nif_api_erros (
-    id            BIGINT IDENTITY(1,1) NOT NULL,
-    nif           BIGINT NULL,
-    data_erro     DATETIME2 NOT NULL DEFAULT GETDATE(),
-    tipo_erro     NVARCHAR(50) NOT NULL,
-    codigo_erro   NVARCHAR(50) NULL,
-    mensagem      NVARCHAR(500) NULL,
-    left_month    INT NULL, left_day INT NULL, left_hour INT NULL,
-    left_minute   INT NULL, left_paid INT NULL,
-    dados_json    NVARCHAR(MAX) NOT NULL,
-    acao          NVARCHAR(50) NULL,
-    resolvido     BIT NOT NULL DEFAULT 0,
-    CONSTRAINT pk_nif_api_erros PRIMARY KEY CLUSTERED (id)
+-- SQLite (utils/cache_validator.py:43)
+CREATE TABLE IF NOT EXISTS nif_ignorados (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    nif                     INTEGER NOT NULL,
+    data_tentativa          TEXT NOT NULL DEFAULT (datetime('now')),
+    data_ultima_consulta    TEXT,         -- data_consulta da linha mais recente em nif_pt
+    dias_desde_ultima       INTEGER,      -- (now - data_ultima).days
+    motivo                  TEXT NOT NULL DEFAULT 'cache_recente'
 );
--- Índices: ix_nif_api_erros_nif, _tipo, _data
+CREATE INDEX IF NOT EXISTS idx_nif_ignorados_nif ON nif_ignorados(nif);
+CREATE INDEX IF NOT EXISTS idx_nif_ignorados_data ON nif_ignorados(data_tentativa);
+-- DDL via _get_connection() (utils/cache_validator.py:126) + init_cache_tables() (consulta_nif.py:536)
+-- Nome configurável via cache_tabela_ignorados (sanitizado alnum+_)
 ```
 
-### 7.4 Azure SQL — `nif_pt` (37 cols, PK `nif`) e `nif_pt_stg` (40 cols, PK `id`)
+| # | Coluna | Tipo | Default | Descrição |
+|---|--------|------|---------|-----------|
+| 1 | `id` | `INTEGER PK` | `AUTOINCREMENT` | PK WAL |
+| 2 | `nif` | `INTEGER` | — | NIF ignorado |
+| 3 | `data_tentativa` | `TEXT` | `datetime('now')` | Timestamp tentativa ignorada |
+| 4 | `data_ultima_consulta` | `TEXT` | `NULL` | `data_consulta` mais recente em `nif_pt` (`is_nif_recente` `:314`) |
+| 5 | `dias_desde_ultima` | `INTEGER` | `NULL` | `diff.days` (`registar_ignorado` `:362`) |
+| 6 | `motivo` | `TEXT` | `'cache_recente'` | Motivo (único default) |
 
-37 cols = `nif`, `nif_valido_formato`, `data_consulta`, `consulta_origem`, `seo_url`, `title`, `alias`, `status`, `start_date`, `activity`, `place_address/pc4/pc3/city`, `address/pc4/pc3/city`, `geo_region/county/parish`, `contacts_email/phone/website/fax`, `structure_nature/capital/capital_currency`, `cae`, `racius`, `portugalio`, `creditos_used`, `creditos_left_month/day/hour/minute/paid`.
+* `PRAGMA journal_mode=WAL` + `executescript(DDL)` + 2 índices em `_get_connection()`; `init_cache_tables()` idempotente (fail-open).
+* `is_nif_recente(nif, dias)` → `SELECT data_consulta FROM nif_pt WHERE nif=? ORDER BY datetime(data_consulta) DESC LIMIT 1` + `_parse_data_consulta` (`YYYY-MM-DD HH:MM:SS`/`ISO`/`Z`) + `total_seconds/86400 < dias`.
 
-`nif_pt_stg` = 37 + `id`, `data_staging`, `processado` (40). `colunas_tabela()` (`importar_nif.py:169`) lista 36 (sem `id/data_*` com `DEFAULT`).
-
-Ver `docs/database/schema.md` para catálogo completo + ER Mermaid.
-
-### 7.5 Criação das tabelas
-
-```powershell
-# SSMS / Azure Data Studio / sqlcmd
-sqlcmd -S kiwa-pt-operations.database.windows.net -d kiwa-pt-operations -i sql/01_criar_tabelas.sql
-sqlcmd -S kiwa-pt-operations.database.windows.net -d kiwa-pt-operations -i sql/02_criar_tabela_erros.sql
-# SQLite cria nif_api_erros automaticamente no próximo consulta_nif.py (init_error_table)
-```
-
-> `01_criar_tabelas.sql` faz `IF OBJECT_ID(...) IS NOT NULL DROP TABLE` — destrutivo. Em prod usar `IF NOT EXISTS CREATE`. Recomenda `CREATE INDEX ON nif_pt_stg(nif, processado) WHERE processado=0`.
+Ver `docs/database/schema.md` para catálogo completo + ER Mermaid 5/15/6c.
 
 ---
 
@@ -484,33 +606,38 @@ sqlcmd -S kiwa-pt-operations.database.windows.net -d kiwa-pt-operations -i sql/0
 
 | Comando | Argumentos | stdin | stdout | stderr | Exit |
 |---------|------------|-------|--------|--------|------|
-| `consulta_nif.py` | `<NIF>` 9 dígitos | — | JSON | `<<nif-pt>>` BOX/TAG/TIMING | `0` ok, `1` erro |
-| `importar_nif_sqlite.py` | — | JSON | — | `BOX Guardado em SQLite` | `0/1` |
-| `importar_nif.py` | — | JSON | — | `BOX Inserido em Azure SQL` | `0/1` |
+| `consulta_nif.py` | `<NIF>` 9 dígitos `[--run-id UUID]` | — | JSON + `run_id` + opcional `ignorado/motivo/data_ultima_consulta/cache_antiguidade_dias` | `<<nif-pt>>` BOX/TAG/TIMING `[cache][run]` | `0` ok/ignorado, `1` erro |
+| `importar_nif_sqlite.py` | `[--run-id UUID]` | JSON + `run_id`/`ignorado` | — | `BOX Guardado em SQLite run_id` / `BOX NIF ignorado - skip SQLite` | `0` ok/skip, `1` erro |
 
 ### 8.1 `consulta_nif.py`
 
 ```
-Uso: python consulta_nif.py <NIF>
+Uso: python consulta_nif.py <NIF> [--run-id <uuid>]
 Exemplo: python consulta_nif.py 509442013
+         python consulta_nif.py 509442013 --run-id 550e8400-e29b-41d4-a716-446655440000
+         python consulta_nif.py 509442013 --run-id=550e8400-e29b-41d4-a716-446655440000
 ```
 
-* `TIMEOUT 10s` + `max_tentativas_global 5` + `retry 60s/3600s` via `error_handler`.
-* `help(consulta_nif.validar_nif)` / `help(consulta_nif.consultar_nif)` para docstrings PEP 257.
+* `TIMEOUT 10s` + `max_tentativas_global 5` + `retry 60s/3600s` via `error_handler` com `run_id` + `cache is_nif_recente` antes de API.
+* `run_id` UUID v4 gerado por `utils/run_id.py:41` + `ensure_run_id(CLI>payload>ctx>gen)` (`consulta_nif.py:481`); `remove_run_id_args` mantém `isdigit` posicional; `--run-id` suportado como `UUID` e `=UUID` (`utils/run_id.py:132`).
+* `help(consulta_nif.validar_nif)` / `help(utils.cache_validator.is_nif_recente)` / `help(utils.run_id.generate_run_id)` para PEP 257.
 
-### 8.2 Importadores
+### 8.2 `importar_nif_sqlite.py`
 
 ```
-Uso: python consulta_nif.py 509442013 | python importar_nif_sqlite.py
+Uso: python consulta_nif.py 509442013 | python importar_nif_sqlite.py [--run-id UUID]
      python importar_nif_sqlite.py < ficheiro.json
-     python consulta_nif.py 509442013 | python importar_nif.py
+     python importar_nif_sqlite.py --run-id 550e8400-e29b-41d4-a716-446655440000 < ficheiro.json
 ```
+
+* Precedência `run_id`: `CLI --run-id` > `JSON payload run_id` > `ContextVar` > `uuid4` (`importar_nif_sqlite.py:185` `ensure_run_id`); herança automática via JSON é o recomendado.
+* Se `resultado.get("ignorado")==True` → `INFO [cache] skip INSERT` + `BOX NIF ignorado - skip SQLite` + `exit 0` sem `INSERT`.
 
 ---
 
 ## 9. Referência de Dados e JSON
 
-### 9.1 Exemplo JSON sucesso (509442013, 2026-09-10)
+### 9.1 Exemplo JSON sucesso (509442013, 2026-09-10) — com `run_id`
 
 ```json
 {
@@ -537,11 +664,36 @@ Uso: python consulta_nif.py 509442013 | python importar_nif_sqlite.py
     "portugalio": null
   },
   "nif_valido_formato": true,
-  "creditos": { "used": "free", "left": [] }
+  "creditos": { "used": "free", "left": [] },
+  "run_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+`run_id` gerado por `utils/run_id.py:41` e propagado via `stdout` → `stdin` importador.
+
+### 9.2 Exemplo JSON cache hit — `ignorado:true` (novo v1.2.0)
+
+```json
+{
+  "nif": "509442013",
+  "valido": true,
+  "fonte": null,
+  "erro": null,
+  "dados": null,
+  "nif_valido_formato": null,
+  "creditos": null,
+  "run_id": "550e8400-e29b-41d4-a716-446655440000",
+  "ignorado": true,
+  "motivo": "cache_recente",
+  "data_ultima_consulta": "2026-09-10 12:00:00",
+  "cache_antiguidade_dias": 30
 }
 ```
 
-### 9.2 Exemplo JSON erro rate-limit (classificado v1.0.0)
+* `ignorado: true` distingue cache hit de erro; `motivo: "cache_recente"` (default `nif_ignorados.motivo`); `data_ultima_consulta` é `data_consulta` mais recente em `nif_pt` (`utils/cache_validator.py:314`); `cache_antiguidade_dias` é `config.yaml:15` janela (30).
+* Persistido em `nif_ignorados` 6c com `dias_desde_ultima` + `motivo` (`utils/cache_validator.py:329` `registar_ignorado`); `importar_nif_sqlite.py:194` não insere `nif_pt`.
+* `exit 0` (não erro) — `importar_nif_sqlite.py` faz skip mas com `exit 0`.
+
+### 9.3 Exemplo JSON erro rate-limit (com `run_id`)
 
 ```json
 {
@@ -554,13 +706,14 @@ Uso: python consulta_nif.py 509442013 | python importar_nif_sqlite.py
     "message": "Limit per minute exceeded",
     "credits": { "left": { "minute": 0, "hour": 9, "day": 99, "month": 999 } }
   },
-  "tipo_erro": "rate_limit_minute"
+  "tipo_erro": "rate_limit_minute",
+  "run_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
-Persistido em `nif_api_erros` com `acao=retry_60s` e retry automático 60s (max 3).
+Persistido em `nif_api_erros` 15c com `run_id` e `acao=retry_60s` (`utils/error_handler.py:368` `guardar_erro(...,run_id)`) e retry automático 60s (max 3).
 
-### 9.3 Exemplo JSON `No records`
+### 9.4 Exemplo JSON `No records` (com `run_id`)
 
 ```json
 {
@@ -569,28 +722,15 @@ Persistido em `nif_api_erros` com `acao=retry_60s` e retry automático 60s (max 
   "fonte": "nif.pt",
   "erro": "No records found",
   "dados": { "result": "No records found", "nif_validation": false },
-  "tipo_erro": "generic_error"
+  "tipo_erro": "generic_error",
+  "run_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
-### 9.4 Mapeamento `mapear_registo()` → SQL
-
-`importar_nif.py:103` desembrulha `dados.{place,geo,contacts,structure}` + `creditos`:
-
-| API | SQL | Parser |
-|-----|-----|--------|
-| `dados.seo_url` | `seo_url` | direto |
-| `dados.cae` lista | `cae` | `extrair_cae() -> ",".join` |
-| `dados.start_date` | `start_date` | `parse_date() -> date` |
-| `structure.capital` | `structure_capital` | `parse_capital() ","→"."` |
-| `creditos.left.month` | `creditos_left_month` | `parse_int()` |
-
-`colunas_tabela()` 36 nomes — `parse_*` devolve `None` → `NULL`.
-
 ### 9.5 Caso `creditos.left`
 
-* **Pago:** `{"month":999,"day":99,"hour":9,"minute":0,"paid":0}` → `parse_int`.
-* **Free (real 2026-09-10):** `[]` → `importar_nif.py:116` `or {}` → `NULL` em SQL (não crasha).
+* **Pago:** `{"month":999,"day":99,"hour":9,"minute":0,"paid":0}` → `dados.creditos`.
+* **Free (real 2026-09-10):** `[]` → `[]` em JSON bruto (sem crash).
 
 ### 9.6 Validação Mod-11
 
@@ -601,20 +741,35 @@ digito = 0 if resto in (0, 1) else 11 - resto
 return digito == int(nif[8])
 ```
 
-`help(consulta_nif.validar_nif)` para docstring completa + exemplos.
+`help(consulta_nif.validar_nif)` para docstring completa.
+
+### 9.7 Campo `run_id` (v1.1.0)
+
+* **Tipo:** `str` UUID v4 `xxxxxxxx-xxxx-4xxx-xxxx-xxxxxxxxxxxx` (36c, 4 hífens) gerado por `utils/run_id.py:41`.
+* **Presença:** sempre em `stdout` JSON (sucesso, erro, `ignorado`).
+* **Propagação:** `stdout` JSON `run_id` → `stdin` importador via `ensure_run_id(CLI>payload>ctx>gen)`; precedência `CLI --run-id` > `payload` > `ContextVar` > `uuid4`.
+* **Persistência:** `nif_pt.run_id TEXT` + `nif_api_erros.run_id TEXT` + índices `run_id`.
+
+### 9.8 Campo `ignorado` (v1.2.0)
+
+* **Tipo:** `bool` (`true` se cache hit) — só quando `cache_ativo==true` e `is_nif_recente(nif, dias)==True`.
+* **Campos adicionais quando `ignorado==true`:** `motivo: "cache_recente"`, `data_ultima_consulta: str` (ISO `YYYY-MM-DD HH:MM:SS` de `nif_pt.data_consulta`), `cache_antiguidade_dias: int` (de `config.yaml:15`).
+* **Comportamento:** `consulta_nif.py` faz `sys.exit(0)` sem `requests.get`; `importar_nif_sqlite.py:194` faz `sys.exit(0)` sem `INSERT` em `nif_pt` (mas `nif_ignorados` já tem `INSERT`).
+* **Desligar:** `config.yaml` `cache_ativo: false` ou `cache_antiguidade_dias: 0` ou `DELETE FROM nif_ignorados/nif_pt WHERE nif=...`.
 
 ---
 
 ## 10. Códigos de Erro e Saída
 
-| `erro` | `tipo_erro` | `exit` | Significado | Ação `error_handler` | Retry |
-|--------|-------------|--------|-------------|----------------------|-------|
-| `null` | — | `0` | Sucesso | — | — |
+| `erro` / `ignorado` | `tipo_erro` / `motivo` | `exit` | Significado | Ação | Retry/Cache |
+|--------|-------------|--------|-------------|------|-------------|
+| `null` | — | `0` | Sucesso (cache miss) | `INSERT nif_pt` 5c | — |
+| `ignorado:true` | `motivo:cache_recente` | `0` | Cache hit — NIF consultado há < `cache_antiguidade_dias` | `INSERT nif_ignorados` 6c, sem API, `importar` skip | Cache `nif_ignorados` |
 | `Uso: ... <NIF>` | — | `1` | Sem argv | — | — |
 | `NIF deve conter apenas dígitos` | — | `1` | `isdigit` fail | — | — |
 | `NIF-PT-KEY não encontrada` | — | `1` | sem chave | — | — |
-| `Timeout na consulta` | — | `1` | `requests.Timeout` | — | `sleep 60s` se `<max_global` |
-| `Erro de rede: ...` | — | `1` | `RequestException` | — | idem |
+| `Timeout na consulta` | — | `1` | `requests.Timeout` | `retry` | `sleep 60s` se `<max_global` |
+| `Erro de rede: ...` | — | `1` | `RequestException` | `retry` | idem |
 | `Resposta inválida (não JSON)` | — | `1` | `JSONDecodeError` | — | — |
 | `Limit per minute` | `rate_limit_minute` | `1` | quota minuto | `retry_60s` | 60s, max 3 + global 5 |
 | `Limit per hour` | `rate_limit_hour` | `1` | quota hora | `retry_3600s` | 3600s, max 2 |
@@ -624,15 +779,15 @@ return digito == int(nif[8])
 | `No records found` / `error` | `generic_error` | `1` | sem registo público | `none` auditoria | 0 |
 | `Nenhum JSON no stdin` | — | `1` | pipe vazio | — | — |
 
-Importadores propagam `resultado.erro` — se `consulta_nif` falhou, não inserem. `tipo_erro` só em erros classificados.
+`ignorado:true` tem `exit 0` (não erro) mas `importar_nif_sqlite.py` não insere `nif_pt`; `tipo_erro` só em erros classificados, `motivo` só em ignorados.
 
 ---
 
 ## 11. Logging
 
-### 11.1 Configuração v1.0.0
+### 11.1 Configuração v1.2.0 (cache + run_id)
 
-`Logging/logging_orchestrator.py` (580L) — **integrado** em todos os scripts (`setup_logging()`):
+`Logging/logging_orchestrator.py` (580L) — **integrado** em todos os scripts (`setup_logging()`) com TAG `[cache][run]`:
 
 * `LOG_LEVEL_GLOBAL/FILE/CONSOLE = INFO` · `FILE_ULTRA_DEBUG/CONSOLE_ULTRA_DEBUG = True`.
 * `LOG_FOLDER='log_files'`, `LOG_OUTPUT_FILE='log_files/nif_pt.log'`, prefixo `<<nif-pt>>`.
@@ -645,31 +800,38 @@ Importadores propagam `resultado.erro` — se `consulta_nif` falhou, não insere
 |---|--------|------|-------|-------|-----|
 | 1 | `BANNER_APP_START/END` | `=` | 49 | INFO | `nif-pt consulta_nif a iniciar/finalizado` |
 | 3 | `BANNER_SECTION` | `-` | 49 | INFO | `Inserir staging` |
-| 5 | `BANNER_FUNCTION` | `~` | 49 | DEBUG | `validar_nif()` `consultar_nif()` `mapear_registo()` |
-| 6 | `TAG` | `[tag]` | — | herda | `[api][valid][cfg][db][sqlite][io][map][erro][rate-limit][cli]` |
+| 5 | `BANNER_FUNCTION` | `~` | 49 | DEBUG | `validar_nif()` `is_nif_recente()` `registar_ignorado()` |
+| 6 | `TAG` | `[tag]` | — | herda | `[api][valid][cfg][db][sqlite][io][cache][erro][rate-limit][cli][run]` |
 | 7 | `SEPARATOR` | `-` | 49 | DEBUG | `---------------------------------------------------` |
-| 8 | `BOX` | `-\|` | 49 | INFO | `| NIF : 509442013 |` `| Consulta com sucesso |` |
-| 9 | `TIMING` | `%.2fs` | — | INFO/DEBUG | `Aplicação concluída em 0.92s` `validar_nif -> 0.00s` |
+| 8 | `BOX` | `-\|` | 49 | INFO | `| NIF : 509442013 |` `| NIF ignorado - cache recente |` `| NIF ignorado - skip SQLite |` `| run_id : 550e8400-... |` |
+| 9 | `TIMING` | `%.2fs` | — | INFO/DEBUG | `Aplicação concluída em 0.92s` `is_nif_recente -> 0.02s` |
 
 Regras: `R1 WIDTH=49 ≤79`, `R4 [tag] lowercase`, `R6 f"{' title ':=^49}"`, `R9 %.2fs` via `time.perf_counter()`.
 
-### 11.3 Exemplo de saída
+**Nova TAG v1.2.0:** `[cache]` — `is_nif_recente` (`utils/cache_validator.py:304`), `registar_ignorado` (`:384`), `consulta_nif.py:546` `NIF ... ignorado`, `importar_nif_sqlite.py:195` `... skip INSERT`.
+
+### 11.3 Exemplo de saída — cache hit
 
 ```
 <<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ===================================================
 <<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ========= nif-pt consulta_nif a iniciar =========
 <<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ===================================================
-<<nif-pt>> 2026-09-10 02:15:32 - consulta_nif - INFO - [api] GET http://www.nif.pt?q=509442013 key=***XXXX timeout=10s
-<<nif-pt>> 2026-09-10 02:15:32 - consulta_nif - WARNING - [rate-limit] Limite por minuto nif=509442013 left_minute=0 — espera 60s retry tipo 1/3 global 1/5
-<<nif-pt>> 2026-09-10 02:15:32 - consulta_nif - INFO - [api] NIF 509442013 válido=True credits used=free left=[] (0.85s)
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - [run] run_id=550e8400-e29b-41d4-a716-446655440000
+<<nif-pt>> 2026-09-10 02:15:32 - utils.cache_validator - INFO - [cache] NIF 509442013 ultima=2026-09-10 12:00:00 dias_desde=0 antiguidade=30 recente=True (0.02s)
+<<nif-pt>> 2026-09-10 02:15:32 - utils.cache_validator - INFO - [cache] Ignorado registado id=1 nif=509442013 ultima=2026-09-10 12:00:00 dias_desde=0 (0.01s)
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - [cache] NIF 509442013 ignorado - ultima consulta 2026-09-10 12:00:00 dentro de 30 dias
 <<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ---------------------------------------------------
-<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - | Consulta com sucesso                          |
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - | NIF ignorado - cache recente                 |
 <<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - | NIF         : 509442013                    |
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - | Ultima      : 2026-09-10 12:00:00            |
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - | Antiguidade : 30 dias                      |
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - | run_id      : 550e8400-e29b-41d4-a716-...  |
 <<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ---------------------------------------------------
-<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - Aplicação concluída em 0.92s
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - [run] run_id=550e8400-e29b-41d4-a716-446655440000
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - Aplicação concluída em 0.05s
 ```
 
-Ver `docs/guides/logging.md` + `docs/technical.md §11`.
+Ver `docs/guides/logging.md` + `docs/technical.md` §11 (logging) + §10c (cache).
 
 ---
 
@@ -681,17 +843,18 @@ Ver `docs/guides/logging.md` + `docs/technical.md §11`.
 |------------|------|
 | `python consulta_nif.py 509442013 \| python importar_nif_sqlite.py` | idem |
 
-### 12.2 Consultar + Azure
+### 12.2 Cache hit — 2ª consulta <30d
 
 | PowerShell | Bash |
 |------------|------|
-| `python consulta_nif.py 509442013 \| python importar_nif.py` | idem |
+| `python consulta_nif.py 509442013` → `{"ignorado":true,...}` | idem |
+| `python consulta_nif.py 509442013 \| python importar_nif_sqlite.py` → `skip INSERT` | idem |
 
-### 12.3 Ambos
+### 12.3 Ambos (pipe)
 
 | PowerShell | Bash |
 |------------|------|
-| `$j = python consulta_nif.py 509442013`<br>`$j \| python importar_nif_sqlite.py`<br>`$j \| python importar_nif.py` | `python consulta_nif.py 509442013 \| tee >(python importar_nif_sqlite.py) \| python importar_nif.py` |
+| `$j = python consulta_nif.py 509442013`<br>`$j \| python importar_nif_sqlite.py` | `python consulta_nif.py 509442013 \| python importar_nif_sqlite.py` |
 
 ### 12.4 Batch
 
@@ -711,20 +874,25 @@ Get-Content nifs.txt | ForEach-Object {
 while read nif; do echo "A consultar $nif"; python consulta_nif.py "$nif" | python importar_nif_sqlite.py; sleep 1; done < nifs.txt
 ```
 
-### 12.5 Histórico SQLite
+### 12.5 Histórico SQLite (com `run_id` + `cache`)
 
 ```powershell
-python -c "import sqlite3,json; conn=sqlite3.connect('data/nif_pt.db'); [print(f'{r[0]}: {r[1]} - {json.loads(r[2])[\"dados\"][\"title\"]}') for r in conn.execute('SELECT id,nif,dados FROM nif_pt ORDER BY data_consulta DESC LIMIT 5')]"
-sqlite3 data/nif_pt.db "SELECT id,nif,data_consulta FROM nif_pt;"
+python -c "import sqlite3,json; conn=sqlite3.connect('data/nif_pt.db'); [print(f'{r[0]}: {r[1]} - {json.loads(r[2])[\"dados\"][\"title\"]} run_id={r[3][:8]}') for r in conn.execute('SELECT id,nif,dados,run_id FROM nif_pt ORDER BY data_consulta DESC LIMIT 5')]"
+sqlite3 data/nif_pt.db "SELECT id,nif,substr(run_id,1,8),data_consulta FROM nif_pt ORDER BY data_consulta DESC LIMIT 5;"
 sqlite3 data/nif_pt.db "SELECT tipo_erro,COUNT(*) FROM nif_api_erros GROUP BY tipo_erro;"
+sqlite3 data/nif_pt.db "SELECT run_id, COUNT(*) FROM nif_pt GROUP BY run_id ORDER BY data_consulta DESC LIMIT 5;"
+sqlite3 data/nif_pt.db "SELECT nif, data_tentativa, data_ultima_consulta, dias_desde_ultima FROM nif_ignorados ORDER BY data_tentativa DESC LIMIT 5;"
+sqlite3 data/nif_pt.db "SELECT COUNT(*) AS sucessos FROM nif_pt; SELECT COUNT(*) AS ignorados FROM nif_ignorados; SELECT COUNT(*) AS erros FROM nif_api_erros;"
 ```
 
-### 12.6 Validar sem créditos
+### 12.6 Validar sem créditos + `cache` + `run_id`
 
 ```powershell
 python -c "from consulta_nif import validar_nif; print(validar_nif('509442013'))"  # True
-python -c "from consulta_nif import validar_nif; print(validar_nif('123456789'))"  # False
-python -c "from utils.error_handler import classificar_erro; print(classificar_erro({'result':'error','message':'Limit per minute'}))"
+python -c "from utils.cache_validator import is_nif_recente; print(is_nif_recente('509442013', dias=30))"
+python -c "from utils.cache_validator import _parse_data_consulta; print(_parse_data_consulta('2026-09-10 12:00:00'))"
+python -c "from utils.run_id import generate_run_id, ensure_run_id; print(generate_run_id()); print(ensure_run_id(payload_value='550e8400-e29b-41d4-a716-446655440000'))"
+python consulta_nif.py 509442013 --run-id 550e8400-e29b-41d4-a716-446655440000 | ConvertFrom-Json | Select-Object nif, run_id, ignorado, motivo
 ```
 
 ---
@@ -734,42 +902,41 @@ python -c "from utils.error_handler import classificar_erro; print(classificar_e
 ### 13.1 `NIF-PT-KEY não encontrada`
 
 1. `Test-Path config\.env` + `Get-Content config\.env` → deve ter `NIF-PT-KEY=xxxxx` com hífen, sem espaços.
-2. `os.getenv("NIF-PT-KEY")` em `config.py:55` — `NIF_PT_KEY` não funciona.
+2. `os.getenv("NIF-PT-KEY")` em `config.py:120` — `NIF_PT_KEY` não funciona.
 3. Solicitar chave em http://www.nif.pt/contactos/api/.
 
 ### 13.2 `Limit per minute/hour` — rate-limit com retry
 
-* `utils/error_handler.py:426` aguarda `60s` (minuto, max 3) ou `3600s` (hora, max 2) com limite global 5. Log: `[rate-limit] Limite por minuto nif=... espera 60s retry tipo 1/3 global 1/5`.
+* `utils/error_handler.py:515` aguarda `60s` (minuto, max 3) ou `3600s` (hora, max 2) com limite global 5. Log: `[rate-limit] Limite por minuto nif=... espera 60s retry tipo 1/3 global 1/5`.
 * Ver `SELECT * FROM nif_api_erros WHERE tipo_erro='rate_limit_minute' ORDER BY data_erro DESC` + `log_files/nif_pt.log`.
-* Se exceder `max_tentativas_*` → `abort_retry_esgotado` com `motivo=max_tipo/max_global`.
 
 ### 13.3 `Limit per day/month` — quota fatal
 
 * `max_tentativas_dia/mes = 0` → `abort` imediato + BOX `Erro fatal - quota diária/mensal excedida` + `exit 1`.
-* Persistido com `acao=abort_day/month` — consultar `nif_api_erros` para auditoria.
+* Persistido com `acao=abort_day/month` — consultar `nif_api_erros`.
 
 ### 13.4 `No records found`
 
-NIF válido sem registo público — não é erro de código; `importar_*.py` não insere; `tipo_erro=generic_error`.
+NIF válido sem registo público — não é erro de código; `importar_nif_sqlite.py` não insere `nif_pt` mas `nif_api_erros` com `generic_error`; `exit 1`.
 
 ### 13.5 `database is locked` (SQLite)
 
-`importar_nif_sqlite.py:50` `PRAGMA journal_mode=WAL` já mitiga; se persistir: `PRAGMA busy_timeout=5000` ou serializar writes.
+`importar_nif_sqlite.py:95` / `utils/cache_validator.py:142` `PRAGMA journal_mode=WAL` já mitiga; se persistir: `PRAGMA busy_timeout=5000` ou serializar writes.
 
 ### 13.6 Validação Mod-11 não bloqueia request
 
-`validar_nif()` só afeta `valido`; `main()` só valida `isdigit`. `123456789` (dígito errado) faz request e gasta crédito. Filtrar antes:
+`validar_nif()` só afeta `valido`; `main()` só valida `isdigit`. `123456789` (dígito errado) faz `is_nif_recente` check + request e gasta crédito (se fora da janela). Filtrar antes:
 
 ```powershell
 python -c "from consulta_nif import validar_nif; import sys; sys.exit(0 if validar_nif('123456789') else 1)" -and python consulta_nif.py 123456789
 ```
 
-### 13.7 Azure SQL `pyodbc.Error`
+### 13.7 `NIF ignorado - cache recente` — não é erro
 
-1. `Test-Path config\.env` + `AZURE_USER/PALAVRA_CHAVE`.
-2. `Get-OdbcDriver -Name "*Driver 18*"` — instalar ODBC 18 se falta.
-3. Whitelist IP no Portal Azure → SQL → Networking.
-4. `Encrypt=yes;TrustServerCertificate=no` (`importar_nif.py:47`) — se SSL erro, verificar cert.
+* É **cache hit** — NIF já em `nif_pt` há < `cache_antiguidade_dias` (30d default). `exit 0`, sem API, regista `nif_ignorados`.
+* Para forçar refresh: `config.yaml` → `cache_ativo: false` ou `cache_antiguidade_dias: 0` ou `DELETE FROM nif_pt WHERE nif=509442013; DELETE FROM nif_ignorados WHERE nif=...;`.
+* Auditoria: `SELECT nif, data_tentativa, data_ultima_consulta, dias_desde_ultima FROM nif_ignorados WHERE nif=509442013 ORDER BY data_tentativa DESC;`.
+* `importar_nif_sqlite.py` faz `skip INSERT` quando recebe `ignorado:true` — log `[cache] ... skip INSERT`.
 
 ### 13.8 `tee` não funciona em PowerShell
 
@@ -777,7 +944,7 @@ python -c "from consulta_nif import validar_nif; import sys; sys.exit(0 if valid
 
 ### 13.9 `ModuleNotFoundError: yaml`
 
-`pip uninstall yaml -y; pip install pyyaml python-dotenv pyodbc` ou `pip install -r requirements.txt` (fix v1.0.0).
+`pip uninstall yaml -y; pip install pyyaml python-dotenv` ou `pip install -r requirements.txt` (fix v1.0.0; v1.2.0 sem `pyodbc`).
 
 ---
 
@@ -785,23 +952,25 @@ python -c "from consulta_nif import validar_nif; import sys; sys.exit(0 if valid
 
 **1. Custo?** Free limitado (`credits.left: []`); paid com `left: {month/day/hour/minute/paid}`.
 
-**2. Créditos?** `creditos.left` dict se `paid`, `[]` se `free`; `importar_nif` → `NULL` se `[]`.
+**2. Créditos?** `creditos.left` dict se `paid`, `[]` se `free`.
 
-**3. SQLite vs Azure?** SQLite JSON bruto (4 cols, WAL) flexível; Azure 36 cols + `nif_api_erros` 14 cols analítico.
+**3. SQLite cache?** `nif_ignorados` 6c audita `is_nif_recente` → se `recente==True` evita `GET` e regista `ignorado`; `importar_nif_sqlite.py` faz skip.
 
-**4. Mod-11?** `Σ d*(9-i)%11 → 0 se resto 0/1 senão 11-resto` == `d[8]` (`consulta_nif.py:48`, `help(validar_nif)`).
+**4. Mod-11?** `Σ d*(9-i)%11 → 0 se resto 0/1 senão 11-resto` == `d[8]` (`consulta_nif.py:99`, `help(validar_nif)`).
 
-**5. Batch?** Sim, `sleep 1` + retry automático `60s/3600s` já trata `rate_limit`.
+**5. Batch?** Sim, `sleep 1` + retry automático `60s/3600s` + cache evita re-pedido <30d; cada iteração tem `run_id` único — agrupar por `run_id`.
 
-**6. `nif_api_erros`?** Auditoria de todos os erros; `SELECT tipo_erro, mensagem, left_minute, acao FROM nif_api_erros`.
+**6. `nif_api_erros` vs `nif_ignorados`?** `nif_api_erros` 15c quota/erros API; `nif_ignorados` 6c cache hit (sem API) — ambas em `data/nif_pt.db` WAL.
 
-**7. `main.py`?** Stub `BANNER+BOX`; futuro `cli.py --nif --to {sqlite,azure,both}`.
+**7. `main.py`?** `92L` `ensure_run_id()` por execução + stub `BANNER+BOX`; futuro `cli.py --nif --to sqlite --no-cache`.
 
-**8. `stg_nunotome`?** Schema pessoal (`config.yaml:33`); mudar para `stg/dbo` se partilhar.
+**8. Help Python?** `help(consulta_nif.validar_nif)`, `help(utils.cache_validator.is_nif_recente)`, `help(utils.run_id.generate_run_id)` (ver `docs/api/help.md`).
 
-**9. Help Python?** `help(consulta_nif.validar_nif)`, `help(utils.error_handler.tratar_erro)` (ver `docs/api/help.md`).
+**9. Histórico?** `SELECT * FROM nif_pt ORDER BY data_consulta DESC`; `SELECT * FROM nif_ignorados ORDER BY data_tentativa DESC` (cache); filtrar por `WHERE run_id='...'` para uma execução.
 
-**10. Histórico?** `SELECT * FROM nif_pt ORDER BY data_consulta DESC` (SQLite) ou `stg_nunotome.nif_pt_stg WHERE processado=0` (Azure).
+**10. `run_id`?** UUID v4 por execução (`utils/run_id.py:41`); `python consulta_nif.py 509442013 --run-id <uuid>` determinístico; propagação `CLI>payload>ctx>gen` via JSON `run_id`.
+
+**11. `cache`?** `config.yaml:15` `cache_ativo: true`, `cache_antiguidade_dias: 30`, `cache_tabela_ignorados: "nif_ignorados"`; `python -c "from utils.cache_validator import is_nif_recente; print(is_nif_recente('509442013', 30))"`; ver `docs/technical.md` §10c.
 
 ---
 
@@ -809,41 +978,41 @@ python -c "from consulta_nif import validar_nif; import sys; sys.exit(0 if valid
 
 ### 15.1 Glossário
 
-Ver [docs/glossary.md](docs/glossary.md). Termos: NIF, Mod-11, CAE, WAL, ODBC, `stg`, `creditos.left`, `nif_valido_formato`, `get_config`, `RotatingFileHandler`, `BOX/TAG/TIMING`, `rate_limit_*`, ADR, C4.
+Ver [docs/glossary.md](docs/glossary.md). Termos: NIF, Mod-11, CAE, WAL, `creditos.left`, `nif_valido_formato`, `get_config`, `RotatingFileHandler`, `BOX/TAG/TIMING`, `rate_limit_*`, ADR, C4, `run_id`, `ContextVar`, `ensure_run_id`, `is_nif_recente`, `registar_ignorado`, `nif_ignorados`, `cache_recente`, `ignorado`.
 
-### 15.2 Estrutura de ficheiros (v1.0.0)
+### 15.2 Estrutura de ficheiros (v1.2.0)
 
 ```
 nif-pt/
-├── consulta_nif.py               # 355L — validar + GET + retry per-tipo+global
-├── importar_nif.py               # 321L — 36 cols → Azure staging
-├── importar_nif_sqlite.py        # 152L — JSON → SQLite WAL
-├── utils/error_handler.py        # 612L — classificar + tratar + guardar + init
-├── Logging/logging_orchestrator.py # 580L — R1-R9, <<nif-pt>>, 10MB/5000/10
-├── main.py                       # 52L — stub
-├── config/config.py              # 70L — get_config() + ***
-├── config/config.yaml            # 37L — default 11 chaves + 3 blocos
-├── sql/01_criar_tabelas.sql      # 157L — nif_pt 37c + nif_pt_stg 40c
-├── sql/02_criar_tabela_erros.sql # 44L — nif_api_erros 14c
-├── docs/technical.md             # v1.0.0 — C4 + sequência + ER + ADRs
-├── docs/api/help.md              # help() verificado
-├── docs/architecture/            # C4 + diagramas Mermaid v1.0.0
-├── docs/database/schema.md       # ER 37/40/14 cols
-├── docs/api/nif-pt-api.md        # contrato nif.pt
-├── data/nif_pt.db                # WAL, ignorado
-├── log_files/nif_pt.log          # RotatingFileHandler, ignorado
-├── requirements.txt              # requests, pyyaml, dotenv, pyodbc
-├── README.md                     # porta de entrada v1.0.0
-├── CHANGELOG.md                  # v1.0.0
+├── consulta_nif.py               # 626L — validar + cache is_nif_recente + GET + retry per-tipo+global + run_id + --run-id + BOX cache
+├── importar_nif_sqlite.py        # 285L — JSON → SQLite WAL 5c + early skip ignorado + run_id + --run-id + migração
+├── utils/cache_validator.py      # 407L — DDL nif_ignorados 6c + 2 índices + is_nif_recente + registar_ignorado + init_cache_tables
+├── utils/run_id.py               # 191L — generate_run_id UUID v4 + ContextVar + ensure_run_id + --run-id parse
+├── utils/error_handler.py        # 806L — classificar + tratar(...,run_id) + guardar(...,run_id) + init 15c run_id
+├── main.py                       # 92L — ensure_run_id por execução + stub
+├── Logging/logging_orchestrator.py # 580L — R1-R9, <<nif-pt>>, 10MB/5000/10, TAG [cache][run]
+├── config/config.py              # 134L — get_config() + *** + cache_* documentado
+├── config/config.yaml            # 31L — default 14 chaves (11 resiliência + 3 cache) + 2 blocos
+├── docs/technical.md             # v1.2.0 — C4 + sequência cache + ER 5/15/6c + catálogo + ADRs (ADR-010 cache)
+├── docs/api/help.md              # help() verificado (validar_nif, is_nif_recente, tratar_erro, generate_run_id)
+├── docs/architecture/            # C4 + diagramas Mermaid v1.2.0 + ADR-009/010
+├── docs/database/schema.md       # ER 5/15/6c + nif_ignorados 6c + índices cache
+├── docs/api/nif-pt-api.md        # contrato nif.pt + payload ignorado + cache
+├── data/nif_pt.db                # WAL, ignorado (auto-cria nif_ignorados)
+├── log_files/nif_pt.log          # RotatingFileHandler, ignorado (BOX cache/run_id)
+├── requirements.txt              # requests, pyyaml, dotenv (sem pyodbc)
+├── README.md                     # porta de entrada v1.2.0
+├── CHANGELOG.md                  # v1.2.0
 └── MANUAL.md                     # este ficheiro
 ```
 
 ### 15.3 Changelog resumido
 
-Ver [CHANGELOG.md](CHANGELOG.md) — `v1.0.0` promove `beta` com `error_handler` + `logging_orchestrator` + `max_tentativas_*`.
+Ver [CHANGELOG.md](CHANGELOG.md) — `v1.2.0` adiciona `cache_validator` + remove Azure; `v1.1.0` adiciona `run_id`; `v1.0.0` promove `beta` com `error_handler` + `logging_orchestrator` + `max_tentativas_*`.
 
 ### 15.4 Referências
 
-* `nif.pt` API: `GET http://www.nif.pt/?json=1&q=<NIF>&key=<KEY>` (`consulta_nif.py:98`)
-* `config/config.py:30` `get_config()` · `utils/error_handler.py:346` `tratar_erro()` · `Logging/logging_orchestrator.py:226` `setup_logging()`
-* [docs/technical.md](docs/technical.md) · [docs/architecture/diagrams.md](docs/architecture/diagrams.md) · [docs/api/help.md](docs/api/help.md)
+* `nif.pt` API: `GET http://www.nif.pt/?json=1&q=<NIF>&key=<KEY>` (`consulta_nif.py:272`)
+* `config/config.py:53` `get_config()` · `utils/cache_validator.py:225` `is_nif_recente` / `:329` `registar_ignorado` / `:163` `init_cache_tables` · `utils/error_handler.py:515` `tratar_erro(...,run_id)` · `utils/run_id.py:41` `generate_run_id` / `:87` `ensure_run_id` · `Logging/logging_orchestrator.py:226` `setup_logging()` + TAG `[cache][run]`
+* `utils/cache_validator.py:43` DDL `nif_ignorados` 6c · `importar_nif_sqlite.py:194` early skip `ignorado` · `consulta_nif.py:529` cache check
+* [docs/technical.md](docs/technical.md) §10c cache · [docs/architecture/diagrams.md](docs/architecture/diagrams.md) · [docs/api/help.md](docs/api/help.md) · [docs/database/schema.md](docs/database/schema.md) 5/15/6c

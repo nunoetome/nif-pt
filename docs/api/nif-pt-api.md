@@ -1,6 +1,6 @@
-# API nif.pt — Contrato v1.0.0
+# API nif.pt — Contrato v1.2.0
 
-> Fonte: `consulta_nif.py:98` `requests.get(url, params={"json":1,"q":nif,"key":API_KEY}, timeout=10)` + `utils/error_handler.py:139` `classificar_erro` + resposta real `509442013` (2026-09-10).
+> Fonte: `consulta_nif.py:99` `validar_nif` + `consulta_nif.py:272` `requests.get(url, params={"json":1,"q":nif,"key":API_KEY}, timeout=10)` + `utils/error_handler.py:196` `classificar_erro` + `utils/cache_validator.py:225` `is_nif_recente` + resposta real `509442013` (2026-09-10).
 
 ## 1. Endpoint
 
@@ -14,9 +14,10 @@ GET http://www.nif.pt/?json=1&q=<NIF>&key=<NIF-PT-KEY>
 | `q` | `string` | ✅ | NIF 9 dígitos (ex: `509442013`) |
 | `key` | `string` | ✅ | Chave http://www.nif.pt/contactos/api/ (`config/.env` `NIF-PT-KEY` com hífen) |
 
-* `API_BASE` de `config.yaml:21` `consulta_nif.api_base` (`http://www.nif.pt`) + `"/"` (`consulta_nif.py:98`).
-* `TIMEOUT 10s` de `config.yaml:3` → `requests.get(timeout=10)` + loop `max_global+1` com `tempo_de_espera 60s` (`consulta_nif.py:28`).
-* `NIF-PT-KEY` mascarada `***XXXX` no log (`consulta_nif.py:100`).
+* `API_BASE` de `config/config.yaml:24` `consulta_nif.api_base` (`http://www.nif.pt`) + `"/"` (`consulta_nif.py:259`).
+* `TIMEOUT 10s` de `config/config.yaml:3` → `requests.get(timeout=10)` + loop `max_global+1` com `tempo_de_espera 60s` (`consulta_nif.py:79`).
+* `NIF-PT-KEY` mascarada `***XXXX` no log (`consulta_nif.py:261`).
+* **Cache antes de API:** `consulta_nif.py:529` `is_nif_recente(nif, dias=30)` verifica `nif_pt` SQLite; se `recente==True` → sem `GET`, devolve JSON `ignorado` e regista `nif_ignorados` (`utils/cache_validator.py:329`).
 
 ## 2. Resposta — Sucesso
 
@@ -53,7 +54,7 @@ GET http://www.nif.pt/?json=1&q=<NIF>&key=<NIF-PT-KEY>
 }
 ```
 
-### 2.2 Normalização `consulta_nif.py:240`
+### 2.2 Normalização `consulta_nif.py:406` + `run_id`
 
 ```python
 records = data.get("records", {})
@@ -61,7 +62,7 @@ registo = records.get(nif, records.get(list(records.keys())[0] if records else N
 ```
 
 * Fallback para primeira chave se `nif` não bater (API pode devolver sem zeros à esquerda).
-* `consulta_nif.py:257` retorna:
+* `consulta_nif.py:423` retorna (com `run_id`):
 
 ```json
 {
@@ -71,15 +72,42 @@ registo = records.get(nif, records.get(list(records.keys())[0] if records else N
   "erro": null,
   "dados": { /* registo acima */ },
   "nif_valido_formato": true,        // data.get("nif_validation")
-  "creditos": { "used": "free", "left": [] }
+  "creditos": { "used": "free", "left": [] },
+  "run_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
 `help(consulta_nif.consultar_nif)` para docstring completa.
 
-## 3. Resposta — Erro (classificada v1.0.0)
+## 3. Resposta — Cache hit (novo v1.2.0)
 
-### 3.1 `result != "success"` — delega a `utils/error_handler` (`consulta_nif.py:150`)
+Quando `utils/cache_validator.py:225` `is_nif_recente(nif, dias=30)==True`, `consulta_nif.py:547` **não faz `GET`** e devolve:
+
+```json
+{
+  "nif": "509442013",
+  "valido": true,
+  "fonte": null,
+  "erro": null,
+  "dados": null,
+  "nif_valido_formato": null,
+  "creditos": null,
+  "run_id": "550e8400-e29b-41d4-a716-446655440000",
+  "ignorado": true,
+  "motivo": "cache_recente",
+  "data_ultima_consulta": "2026-09-10 12:00:00",
+  "cache_antiguidade_dias": 30
+}
+```
+
+* `ignorado: true` + `motivo: "cache_recente"` distingue de erro; `importar_nif_sqlite.py:194` faz early skip (sem `INSERT`).
+* Persistido em `nif_ignorados` 6c (`utils/cache_validator.py:329` `registar_ignorado`) com `dias_desde_ultima`.
+* Config via `config/config.yaml:15` `cache_ativo`, `cache_antiguidade_dias`, `cache_tabela_ignorados`; `cache_ativo: false` ou `cache_antiguidade_dias: 0` desliga.
+* Log `stderr` `INFO [cache] NIF ... ignorado` + `BOX NIF ignorado - cache recente`.
+
+## 4. Resposta — Erro (classificada v1.0.0 + run_id)
+
+### 4.1 `result != "success"` — delega a `utils/error_handler` (`consulta_nif.py:312`)
 
 ```json
 {
@@ -91,11 +119,11 @@ registo = records.get(nif, records.get(list(records.keys())[0] if records else N
 }
 ```
 
-→ `classificar_erro()` (`utils/error_handler.py:139`) → `rate_limit_minute` (prioridade `Limit per minute` na `message_lower`; fallback `left.minute==0`).
+→ `classificar_erro()` (`utils/error_handler.py:196`) → `rate_limit_minute` (prioridade `Limit per minute` na `message_lower`; fallback `left.minute==0`).
 
-→ `tratar_erro()` (`:346`) → `{tipo:"rate_limit_minute", acao:"retry", espera:60, deve_retry: tenta<3 && global<5, max_tipo:3, max_global:5}` + `guardar_erro()` → `nif_api_erros` 14c.
+→ `tratar_erro()` (`:515`) → `{tipo:"rate_limit_minute", acao:"retry", espera:60, deve_retry: tenta<3 && global<5, max_tipo:3, max_global:5}` + `guardar_erro(...,run_id)` → `nif_api_erros` 15c.
 
-→ `consulta_nif.py:192` `retry` `sleep 60s` se `deve_retry` e `<max_global`, senão `abort`.
+→ `consulta_nif.py:356` `retry` `sleep 60s` se `deve_retry` e `<max_global`, senão `abort` + JSON com `tipo_erro` + `run_id`.
 
 **Tabela de classificação:**
 
@@ -111,7 +139,7 @@ registo = records.get(nif, records.get(list(records.keys())[0] if records else N
 
 Ver `docs/technical.md §10` para lógica `&&` (per-tipo e global).
 
-### 3.2 `No records found` (genérico)
+### 4.2 `No records found` (genérico)
 
 ```json
 {
@@ -122,9 +150,9 @@ Ver `docs/technical.md §10` para lógica `&&` (per-tipo e global).
 }
 ```
 
-→ `generic_error`, `acao=none`, persistido mas sem retry; `consulta_nif.py:216` retorna `erro: result`, `tipo_erro: generic_error`.
+→ `generic_error`, `acao=none`, persistido mas sem retry; `consulta_nif.py:379` retorna `erro: result`, `tipo_erro: generic_error`, `run_id`.
 
-### 3.3 Erros de rede (`consulta_nif.py:123`)
+### 4.3 Erros de rede (`consulta_nif.py:284`)
 
 | Exceção | `erro` | `valido` | Retry |
 |---------|--------|----------|-------|
@@ -132,7 +160,9 @@ Ver `docs/technical.md §10` para lógica `&&` (per-tipo e global).
 | `RequestException` | `Erro de rede: ...` | `validar_nif(nif)` | idem |
 | `JSONDecodeError` | `Resposta inválida (não JSON)` | `validar_nif(nif)` | — (fatal) |
 
-### 3.4 Sem chave (`consulta_nif.py:88`)
+Todos com `run_id`.
+
+### 4.4 Sem chave (`consulta_nif.py:248`)
 
 ```json
 {
@@ -140,36 +170,38 @@ Ver `docs/technical.md §10` para lógica `&&` (per-tipo e global).
   "valido": true,
   "fonte": null,
   "erro": "NIF-PT-KEY não encontrada no .env",
-  "dados": null
+  "dados": null,
+  "run_id": "550e8400-..."
 }
 ```
-Sem request; `exit 1`.
+Sem request (e sem cache); `exit 1`.
 
-## 4. Validação
+## 5. Validação
 
-`consulta_nif.py:48` `validar_nif()` — `Σ d*(9-i)%11 → 0 se resto 0/1 senão 11-resto` == `d[8]`.
+`consulta_nif.py:99` `validar_nif()` — `Σ d*(9-i)%11 → 0 se resto 0/1 senão 11-resto` == `d[8]`.
 
-* `main():303` valida `isdigit` antes de rede → `{"erro":"NIF deve conter apenas dígitos"}`.
+* `main():513` valida `isdigit` antes de rede/cache → `{"erro":"NIF deve conter apenas dígitos","run_id":...}`.
 * Mod-11 só afeta `valido`; **não bloqueia** `requests.get` (log `WARN`).
 
 `help(consulta_nif.validar_nif)` para exemplos `509442013 True` / `123456789 False`.
 
-## 5. Créditos
+## 6. Créditos
 
 | Campo | Tipo | Descrição |
 |-------|------|-----------|
 | `credits.used` | `string` | `"free"` ou `"paid"` |
 | `credits.left` | `dict` ou `[]` | `paid`: `{"month":int,"day":int,"hour":int,"minute":int,"paid":int}`; `free`: `[]` lista vazia (real 2026-09-10) |
 
-`importar_nif.py:116` `creditos.get("left") or {}` → `{}` se `[]` → `parse_int(None)` → `NULL` (não crasha) + `map` logado.
+Sem Azure, `creditos.left` só é persistido no JSON bruto `nif_pt.dados` (não há 37c normalizadas).
 
-## 6. Timeouts e Retry (v1.0.0)
+## 7. Timeouts, Retry e Cache (v1.2.0)
 
-* `TIMEOUT 10s` (`config.yaml:3`) → `requests.get(timeout=10)` — 10s, não 1000.
-* `retry_count 1` legado fallback; ativo são `max_tentativas_global 5 / minuto 3 / hora 2 / dia 0 / mes 0` + `tempo_espera_minuto 60s / hora 3600s` via `utils/error_handler` (`consulta_nif.py:35`, `utils/error_handler.py:215`).
+* `TIMEOUT 10s` (`config/config.yaml:3`) → `requests.get(timeout=10)`.
+* `retry_count 1` legado fallback; ativo são `max_tentativas_global 5 / minuto 3 / hora 2 / dia 0 / mes 0` + `tempo_espera_minuto 60s / hora 3600s` via `utils/error_handler` (`consulta_nif.py:79`, `utils/error_handler.py:272`).
 * Lógica conjunta: `tenta_tipo < max_tipo && tenta_global < max_global` → só retry se ambos permitirem.
+* **Cache:** `cache_ativo true` + `cache_antiguidade_dias 30` → `is_nif_recente()` evita `GET` para NIFs com `nif_pt.data_consulta` dentro da janela; `nif_ignorados` audita; `importar_nif_sqlite.py:194` não insere `ignorado`.
 
-## 7. Exemplo `curl` / PowerShell / Python
+## 8. Exemplo `curl` / PowerShell / Python
 
 ```bash
 curl "http://www.nif.pt/?json=1&q=509442013&key=SUA_CHAVE"
@@ -177,14 +209,13 @@ curl "http://www.nif.pt/?json=1&q=509442013&key=SUA_CHAVE"
 python consulta_nif.py 509442013 | python -m json.tool
 # PowerShell:
 python consulta_nif.py 509442013 | ConvertFrom-Json | Format-List
+# Cache hit (2ª vez em <30d):
+python consulta_nif.py 509442013
+# -> {"ignorado": true, "motivo": "cache_recente", "data_ultima_consulta": "...", "run_id": "..."}
 ```
-
-## 8. Mapeamento para SQL
-
-`importar_nif.py:103` `mapear_registo()` 36c + `docs/database/schema.md` §4. `help(importar_nif.mapear_registo)` para docstring.
 
 ## 9. Referências
 
-* `consulta_nif.py:98` `url + params` · `consulta_nif.py:150` `tratar_erro()` · `utils/error_handler.py:139` `classificar_erro()`
-* `docs/technical.md` §3 sequência · `docs/api/help.md` `help(tratar_erro)`
+* `consulta_nif.py:99` `validar_nif` · `consulta_nif.py:171` `consultar_nif` · `consulta_nif.py:529` cache `is_nif_recente` · `utils/cache_validator.py:225` `is_nif_recente` · `utils/error_handler.py:196` `classificar_erro()`
+* `docs/technical.md` §3 sequência cache · `docs/api/help.md` `help(is_nif_recente)` + `help(tratar_erro)`
 * http://www.nif.pt/contactos/api/
