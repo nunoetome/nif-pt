@@ -1,12 +1,12 @@
-# Esquemas de Base de Dados — nif-pt v1.1.0 (run_id)
+# Esquemas de Base de Dados — nif-pt v1.2.0 (cache + run_id)
 
-> Fonte: `sql/01_criar_tabelas.sql` (169L) + `sql/02_criar_tabela_erros.sql` (47L) + `sql/03_migracao_run_id.sql` (39L) + `importar_nif_sqlite.py:55` + `utils/error_handler.py:46` + `importar_nif.py:334` `colunas_tabela()` + `utils/run_id.py`.
+> Fonte: `importar_nif_sqlite.py:55` (DDL `nif_pt` 5c) + `utils/error_handler.py:46` (DDL `nif_api_erros` 15c) + `utils/cache_validator.py:43` (DDL `nif_ignorados` 6c) + `config/config.yaml:15` (`cache_*`) + `utils/run_id.py`.
 
-## 1. Visão Geral v1.1.0
+## 1. Visão Geral v1.2.0
 
 ```mermaid
 erDiagram
-    sqlite_nif_pt {
+    nif_pt {
         INTEGER id PK
         INTEGER nif
         TEXT dados
@@ -30,34 +30,25 @@ erDiagram
         TEXT run_id
         INTEGER resolvido
     }
-    nif_pt {
-        BIGINT nif PK
-        BIT nif_valido_formato
-        DATETIME2 data_consulta
-        NVARCHAR title
-        NVARCHAR cae
-        INT creditos_left_minute
-        NVARCHAR run_id
+    nif_ignorados {
+        INTEGER id PK
+        INTEGER nif
+        TEXT data_tentativa
+        TEXT data_ultima_consulta
+        INTEGER dias_desde_ultima
+        TEXT motivo
     }
-    nif_pt_stg {
-        BIGINT id PK
-        BIGINT nif
-        DATETIME2 data_staging
-        BIT processado
-        NVARCHAR title
-        NVARCHAR run_id
-    }
-    nif_pt_stg ||--o{ nif_pt : "MERGE WHERE processado=0"
-    sqlite_nif_pt ||--o{ nif_api_erros : "mesma DB WAL run_id"
+    nif_pt ||--o{ nif_ignorados : "is_nif_recente<br/>cache_recente"
+    nif_pt ||--o{ nif_api_erros : "mesma DB WAL<br/>run_id"
 ```
 
-| BD | Tabela | Cols | PK | Histórico | Estratégia | DDL |
-|----|--------|------|----|-----------|------------|-----|
-| SQLite | `nif_pt` | 5 (4+`run_id TEXT`) | `id AUTOINCREMENT` | Sim | JSON bruto + `run_id` | `importar_nif_sqlite.py:55` + `sql/03_migracao_run_id.sql` |
-| SQLite | `nif_api_erros` | 15 (14+`run_id TEXT`) | `id AUTOINCREMENT` | Sim | Auditoria + `run_id` | `utils/error_handler.py:46` + `sql/03_migracao_run_id.sql` |
-| Azure | `nif_pt` | 38 (37+`run_id NVARCHAR36`) | `nif` | Não (ouro) | 37c normalizadas + `run_id` | `sql/01_criar_tabelas.sql:21` + `sql/03_migracao_run_id.sql:15` |
-| Azure | `nif_pt_stg` | 41 (40+`run_id NVARCHAR36`) | `id IDENTITY` | Sim (`processado`) | Staging + merge + `run_id` | `sql/01_criar_tabelas.sql:99` + `sql/03_migracao_run_id.sql:22` |
-| Azure | `nif_api_erros` | 15 (14+`run_id NVARCHAR36`) | `id IDENTITY` | Sim (`resolvido`) | Auditoria + `run_id` | `sql/02_criar_tabela_erros.sql:20` + `sql/03_migracao_run_id.sql:30` |
+| Tabela | Motor | Cols | PK | Histórico | Estratégia | DDL |
+|--------|-------|------|----|-----------|------------|-----|
+| `nif_pt` | `data/nif_pt.db` SQLite WAL | 5 (`id, nif, dados, data_consulta, run_id`) | `id AUTOINCREMENT` | Sim (sem `UNIQUE nif`) | JSON bruto + `run_id` | `importar_nif_sqlite.py:55` |
+| `nif_api_erros` | `data/nif_pt.db` SQLite WAL | 15 (14 + `run_id`) | `id AUTOINCREMENT` | Sim | Auditoria `rate_limit_*` + `run_id` | `utils/error_handler.py:46` |
+| `nif_ignorados` | `data/nif_pt.db` SQLite WAL | 6 (`id, nif, data_tentativa, data_ultima_consulta, dias_desde_ultima, motivo`) | `id AUTOINCREMENT` | Sim | Cache `is_nif_recente` + `registar_ignorado` | `utils/cache_validator.py:43` |
+
+> v1.2.0 removeu Azure SQL (`sql/01_criar_tabelas.sql`, `sql/02_criar_tabela_erros.sql`, `sql/03_migracao_run_id.sql`, `pyodbc`, `kiwa-pt-operations/stg_nunotome`). Stack só SQLite WAL.
 
 ## 2. SQLite — `nif_pt` (5c: 4+`run_id`)
 
@@ -67,7 +58,7 @@ erDiagram
 CREATE TABLE IF NOT EXISTS nif_pt (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     nif           INTEGER NOT NULL,
-    dados         TEXT NOT NULL,          -- json.dumps(resultado, ensure_ascii=False)
+    dados         TEXT NOT NULL,          -- json.dumps(resultado, ensure_ascii=False) inclui run_id
     data_consulta TEXT NOT NULL DEFAULT (datetime('now')),
     run_id        TEXT                    -- UUID v4 da execução (utils/run_id.py:41)
 );
@@ -81,14 +72,14 @@ CREATE INDEX IF NOT EXISTS idx_nif_pt_run_id ON nif_pt(run_id);
 | 1 | `id` | `INTEGER` | `NOT NULL` | `AUTOINCREMENT` | PK WAL |
 | 2 | `nif` | `INTEGER` | `NOT NULL` | — | NIF 9 dígitos |
 | 3 | `dados` | `TEXT` | `NOT NULL` | — | JSON completo `resultado` (inclui `run_id`) |
-| 4 | `data_consulta` | `TEXT` | `NOT NULL` | `datetime('now')` | `YYYY-MM-DD HH:MM:SS` (`datetime.now()` em `importar_nif_sqlite.py:223`) |
-| 5 | `run_id` | `TEXT` | `NULL` | — | UUID v4 por execução (`utils/run_id.py:41` `generate_run_id()`); índice `idx_nif_pt_run_id` |
+| 4 | `data_consulta` | `TEXT` | `NOT NULL` | `datetime('now')` | `YYYY-MM-DD HH:MM:SS` (`datetime.now()` em `importar_nif_sqlite.py:240`) |
+| 5 | `run_id` | `TEXT` | `NULL` | — | UUID v4 por execução (`utils/run_id.py:41`); índice `idx_nif_pt_run_id` |
 
-* `PRAGMA journal_mode=WAL` (`importar_nif_sqlite.py:95`) · `DB_PATH = Path(...) / cfg.get("db_path", "data/nif_pt.db")` (`:52`) · sem `UNIQUE(nif)` → histórico; último com `ORDER BY data_consulta DESC LIMIT 1` · `json_extract(dados, '$.dados.title')` (SQLite 3.38+) · `run_id` propagado via `ensure_run_id(CLI>payload>ctx>gen)` (`importar_nif_sqlite.py:185`) e `INSERT (...,run_id)` com fallback se coluna falta (`:221`).
+* `PRAGMA journal_mode=WAL` (`importar_nif_sqlite.py:95`) · `DB_PATH = Path(...) / cfg.get("db_path", "data/nif_pt.db")` (`:52`) · sem `UNIQUE(nif)` → histórico; `is_nif_recente()` (`utils/cache_validator.py:225`) lê `ORDER BY datetime(data_consulta) DESC LIMIT 1`; `json_extract(dados, '$.dados.title')` (SQLite 3.38+) · `run_id` propagado via `ensure_run_id(CLI>payload>ctx>gen)` (`importar_nif_sqlite.py:185`) e `INSERT (...,run_id)` com fallback se coluna falta (`:238`).
 
-## 3. SQLite/Azure — `nif_api_erros` (15c: 14+`run_id`)
+## 3. SQLite — `nif_api_erros` (15c: 14+`run_id`)
 
-### 3.1 DDL SQLite (`utils/error_handler.py:46`)
+### 3.1 DDL (`utils/error_handler.py:46`)
 
 ```sql
 CREATE TABLE IF NOT EXISTS nif_api_erros (
@@ -111,40 +102,15 @@ CREATE INDEX IF NOT EXISTS idx_nif_api_erros_run_id ON nif_api_erros(run_id);
 -- Migração idempotente (utils/error_handler.py:153): PRAGMA table_info -> ALTER TABLE ADD COLUMN run_id TEXT se falta
 ```
 
-### 3.2 DDL Azure (`sql/02_criar_tabela_erros.sql:20`)
-
-```sql
-CREATE TABLE stg_nunotome.nif_api_erros (
-    id            BIGINT IDENTITY(1,1) NOT NULL,
-    nif           BIGINT NULL,
-    data_erro     DATETIME2 NOT NULL DEFAULT GETDATE(),
-    tipo_erro     NVARCHAR(50) NOT NULL,
-    codigo_erro   NVARCHAR(50) NULL,
-    mensagem      NVARCHAR(500) NULL,
-    left_month    INT NULL, left_day INT NULL, left_hour INT NULL,
-    left_minute   INT NULL, left_paid INT NULL,
-    dados_json    NVARCHAR(MAX) NOT NULL,
-    acao          NVARCHAR(50) NULL,
-    run_id        NVARCHAR(36) NULL,       -- UUID v4 da execução
-    resolvido     BIT NOT NULL DEFAULT 0,
-    CONSTRAINT pk_nif_api_erros PRIMARY KEY CLUSTERED (id)
-);
-CREATE INDEX ix_nif_api_erros_nif ON stg_nunotome.nif_api_erros(nif);
-CREATE INDEX ix_nif_api_erros_tipo ON stg_nunotome.nif_api_erros(tipo_erro);
-CREATE INDEX ix_nif_api_erros_data ON stg_nunotome.nif_api_erros(data_erro);
-CREATE INDEX ix_nif_api_erros_run_id ON stg_nunotome.nif_api_erros(run_id);
--- Migração idempotente para BDs existentes: sql/03_migracao_run_id.sql:30
-```
-
-### 3.3 Catálogo `nif_api_erros` (15c)
+### 3.2 Catálogo `nif_api_erros` (15c)
 
 | Grupo | Colunas | Tipos | Fonte |
 |-------|---------|-------|-------|
-| Chave | `id`, `nif`, `data_erro`, `resolvido` | `BIGINT/INTEGER`, `DATETIME2/TEXT`, `BIT/INTEGER` | `nif`, `GETDATE()`/`datetime('now')`, `0` |
-| Classificação | `tipo_erro`, `codigo_erro`, `mensagem`, `acao` | `NVARCHAR(50)/TEXT` | `classificar_erro()` + `tratar_erro()` |
-| Quota | `left_month/day/hour/minute/paid` | `INT/INTEGER` | `data["credits"]["left"]` |
-| Auditoria | `dados_json` | `NVARCHAR(MAX)/TEXT` | `json.dumps(data, ensure_ascii=False)` |
-| Rastreabilidade | `run_id` | `NVARCHAR(36)/TEXT` | `utils/run_id.py:41` `generate_run_id()` + `ensure_run_id()` + `guardar_erro(...,run_id)` |
+| Chave | `id`, `nif`, `data_erro`, `resolvido` | `INTEGER`, `TEXT`, `INTEGER` | `nif`, `datetime('now')`, `0` |
+| Classificação | `tipo_erro`, `codigo_erro`, `mensagem`, `acao` | `TEXT` | `classificar_erro()` + `tratar_erro()` |
+| Quota | `left_month/day/hour/minute/paid` | `INTEGER` | `data["credits"]["left"]` |
+| Auditoria | `dados_json` | `TEXT` | `json.dumps(data, ensure_ascii=False)` |
+| Rastreabilidade | `run_id` | `TEXT` | `utils/run_id.py:41` `generate_run_id()` + `ensure_run_id()` + `guardar_erro(...,run_id)` |
 
 Consultas úteis:
 
@@ -156,166 +122,109 @@ SELECT nif, mensagem, left_minute, acao, data_erro, substr(run_id,1,8) FROM nif_
 -- Por run_id (agrupa retries da mesma execução)
 SELECT tipo_erro, acao, run_id, COUNT(*) FROM nif_api_erros GROUP BY run_id, tipo_erro ORDER BY data_erro DESC;
 SELECT * FROM nif_api_erros WHERE run_id='550e8400-e29b-41d4-a716-446655440000';
--- Azure
-SELECT * FROM stg_nunotome.nif_api_erros WHERE run_id='550e8400-...' ORDER BY data_erro DESC;
 -- Por resolver
-SELECT * FROM stg_nunotome.nif_api_erros WHERE resolvido=0;
-UPDATE stg_nunotome.nif_api_erros SET resolvido=1 WHERE id=123;
+SELECT * FROM nif_api_erros WHERE resolvido=0;
+UPDATE nif_api_erros SET resolvido=1 WHERE id=123;
 ```
 
-## 4. Azure SQL — `nif_pt` (38c: 37+`run_id`, PK `nif`)
+## 4. SQLite — `nif_ignorados` (6c) — novo v1.2.0
 
-### 4.1 DDL (`sql/01_criar_tabelas.sql:21`)
+### 4.1 DDL (`utils/cache_validator.py:43`)
 
 ```sql
-CREATE TABLE stg_nunotome.nif_pt (
-    nif                     BIGINT NOT NULL,
-    nif_valido_formato      BIT NULL,
-    data_consulta           DATETIME2 NOT NULL DEFAULT GETDATE(),
-    consulta_origem         NVARCHAR(50) NULL DEFAULT 'nif.pt',
-    seo_url                 NVARCHAR(255) NULL, title NVARCHAR(500) NULL,
-    alias                   NVARCHAR(500) NULL, status NVARCHAR(50) NULL,
-    start_date              DATE NULL, activity NVARCHAR(MAX) NULL,
-    place_address           NVARCHAR(500) NULL, place_pc4 NVARCHAR(10) NULL,
-    place_pc3               NVARCHAR(10) NULL, place_city NVARCHAR(100) NULL,
-    address                 NVARCHAR(500) NULL, pc4 NVARCHAR(10) NULL,
-    pc3                     NVARCHAR(10) NULL, city NVARCHAR(100) NULL,
-    geo_region              NVARCHAR(100) NULL, geo_county NVARCHAR(100) NULL,
-    geo_parish              NVARCHAR(100) NULL,
-    contacts_email          NVARCHAR(255) NULL, contacts_phone NVARCHAR(50) NULL,
-    contacts_website        NVARCHAR(255) NULL, contacts_fax NVARCHAR(50) NULL,
-    structure_nature        NVARCHAR(50) NULL, structure_capital DECIMAL(18,2) NULL,
-    structure_capital_currency NVARCHAR(10) NULL,
-    cae                     NVARCHAR(500) NULL, racius NVARCHAR(500) NULL,
-    portugalio              NVARCHAR(500) NULL,
-    creditos_used           NVARCHAR(50)    NULL, creditos_left_month INT NULL,
-    creditos_left_day       INT NULL, creditos_left_hour INT NULL,
-    creditos_left_minute    INT NULL, creditos_left_paid INT NULL,
-    run_id                  NVARCHAR(36)    NULL,       -- UUID v4 da execução
-    CONSTRAINT pk_nif_pt PRIMARY KEY CLUSTERED (nif)
+CREATE TABLE IF NOT EXISTS nif_ignorados (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    nif                     INTEGER NOT NULL,
+    data_tentativa          TEXT NOT NULL DEFAULT (datetime('now')),
+    data_ultima_consulta    TEXT,
+    dias_desde_ultima       INTEGER,
+    motivo                  TEXT NOT NULL DEFAULT 'cache_recente'
 );
-CREATE INDEX ix_nif_pt_run_id ON stg_nunotome.nif_pt(run_id);
+CREATE INDEX IF NOT EXISTS idx_nif_ignorados_nif ON nif_ignorados(nif);
+CREATE INDEX IF NOT EXISTS idx_nif_ignorados_data ON nif_ignorados(data_tentativa);
+-- DDL idempotente via _get_connection() (utils/cache_validator.py:126) + init_cache_tables() (consulta_nif.py:536)
+-- Nome de tabela configurável via config/config.yaml:15 cache_tabela_ignorados (sanitizado alnum+_)
 ```
 
-### 4.2 Catálogo por grupo (ver `docs/technical.md` §6 para condensado)
+### 4.2 Catálogo `nif_ignorados` (6c)
 
-| Grupo | Colunas | Fonte API |
-|-------|---------|-----------|
-| Chave/controlo | `nif`, `nif_valido_formato`, `data_consulta`, `consulta_origem`, `run_id` | `resultado.nif`, `nif_validation`, `GETDATE()`, `fonte`, `run_id` (`utils/run_id.py`) |
-| Identificação | `seo_url`, `title`, `alias`, `status`, `start_date`, `activity` | `dados.*` + `parse_date` |
-| Morada place/address | `place_address/pc4/pc3/city`, `address/pc4/pc3/city` | `dados.place.*`, `dados.address` |
-| Geo | `geo_region/county/parish` | `dados.geo.*` |
-| Contactos | `contacts_email/phone/website/fax` | `dados.contacts.*` |
-| Estrutura | `structure_nature/capital/capital_currency` | `dados.structure.*` + `parse_capital` |
-| CAE | `cae` | `dados.cae` → `extrair_cae` `",".join` |
-| Links | `racius`, `portugalio` | `dados.racius/portugalio` |
-| Créditos | `creditos_used`, `left_month/day/hour/minute/paid` | `creditos.*` + `parse_int` |
-| Rastreabilidade | `run_id` | `resultado.run_id` / `ensure_run_id()` |
+| # | Coluna | Tipo | Nulo | Default | Descrição |
+|---|--------|------|------|---------|-----------|
+| 1 | `id` | `INTEGER` | `NOT NULL` | `AUTOINCREMENT` | PK WAL |
+| 2 | `nif` | `INTEGER` | `NOT NULL` | — | NIF consultado (ignorado por cache) |
+| 3 | `data_tentativa` | `TEXT` | `NOT NULL` | `datetime('now')` | Timestamp da tentativa ignorada (`YYYY-MM-DD HH:MM:SS`) |
+| 4 | `data_ultima_consulta` | `TEXT` | `NULL` | — | `data_consulta` da linha mais recente em `nif_pt` (`is_nif_recente` `:314` `data_str`) |
+| 5 | `dias_desde_ultima` | `INTEGER` | `NULL` | — | `diff.days` entre `now` e `data_ultima_consulta` (`registar_ignorado` `:362`); `0` se futuro |
+| 6 | `motivo` | `TEXT` | `NOT NULL` | `'cache_recente'` | Motivo do ignorado (default único) |
 
-*PK `nif` único → só ouro. `DROP TABLE IF EXISTS` destrutivo — ver ddl-history. `run_id` indexado `ix_nif_pt_run_id`.*
+* Criada por `utils/cache_validator.py:126` `_get_connection()` com `PRAGMA WAL` + `executescript(DDL_IGNORADOS)` + 2 índices `idx_nif_ignorados_*`; chamada idempotente em `consulta_nif.py:536` `init_cache_tables()` (fail-open) e em cada `is_nif_recente`/`registar_ignorado`.
+* Relação: `nif_pt` (fonte) → `nif_ignorados` (tentativas ignoradas) via `is_nif_recente()` → `registar_ignorado()`; não há FK declarada (SQLite sem constraint), mas `nif` é chave lógica.
+* Config: `config/config.yaml:15` `cache_tabela_ignorados: "nif_ignorados"` sanitizado `replace("_","").isalnum()` (`utils/cache_validator.py:121`).
 
-*PK `nif` único → só ouro. `DROP TABLE IF EXISTS` destrutivo — ver ddl-history.*
-
-## 5. Azure SQL — `nif_pt_stg` (41c: 40+`run_id`, PK `id`)
-
-### 5.1 DDL (`sql/01_criar_tabelas.sql:93`)
+### 4.3 Exemplos `nif_ignorados`
 
 ```sql
-CREATE TABLE stg_nunotome.nif_pt_stg (
-    id            BIGINT IDENTITY(1,1) NOT NULL,
-    -- ... mesmos 38c do nif_pt mas com data_staging + processado ...
-    data_staging  DATETIME2 NOT NULL DEFAULT GETDATE(),
-    processado    BIT NOT NULL DEFAULT 0,
-    run_id        NVARCHAR(36) NULL,       -- UUID v4 da execução
-    CONSTRAINT pk_nif_pt_stg PRIMARY KEY CLUSTERED (id)
-);
-CREATE INDEX ix_nif_pt_stg_run_id ON stg_nunotome.nif_pt_stg(run_id);
+-- Últimas tentativas ignoradas
+SELECT nif, data_ultima_consulta, dias_desde_ultima, motivo, data_tentativa
+FROM nif_ignorados ORDER BY datetime(data_tentativa) DESC LIMIT 20;
+
+-- Por NIF
+SELECT nif, COUNT(*) AS tentativas_ignoradas, MAX(data_tentativa) AS ultima_tentativa
+FROM nif_ignorados GROUP BY nif ORDER BY tentativas_ignoradas DESC;
+
+-- Auditoria cache vs sucesso
+SELECT 'nif_pt' AS tabela, COUNT(*) AS total FROM nif_pt
+UNION ALL
+SELECT 'nif_ignorados', COUNT(*) FROM nif_ignorados
+UNION ALL
+SELECT 'nif_api_erros', COUNT(*) FROM nif_api_erros;
+
+-- Limpar cache para forçar refresh
+DELETE FROM nif_ignorados WHERE nif=509442013;
+DELETE FROM nif_ignorados WHERE date(data_tentativa) < date('now','-30 days');
 ```
 
-### 5.2 Diferença `nif_pt` vs `nif_pt_stg`
+### 4.4 Fluxo cache ↔ tabelas
 
-| Coluna | `nif_pt` (38c) | `nif_pt_stg` (41c) | Notas |
-|--------|----------|--------------|-------|
-| `id` | ❌ | ✅ `IDENTITY` | histórico |
-| `data_staging` | ❌ | ✅ `GETDATE()` | timestamp staging |
-| `processado` | ❌ | ✅ `DEFAULT 0` | flag merge |
-| `run_id` | ✅ `NVARCHAR36` | ✅ `NVARCHAR36` | rastreabilidade `idx_run_id` |
-| Restantes 37 | ✅ | ✅ | — |
-| Restantes 37 (sem `data_consulta` mas com `run_id`) | — | — | `colunas_tabela()` 37 = 38-1 = 41-4 (inclui `run_id`) |
-
-### 5.3 Coerência Python ↔ SQL
-
-`importar_nif.py:334` `colunas_tabela()` → 37 (36+`run_id`):
-
-```python
-["nif", "nif_valido_formato", "consulta_origem",
- "seo_url", "title", "alias", "status", "start_date", "activity",
- "place_address", "place_pc4", "place_pc3", "place_city",
- "address", "pc4", "pc3", "city",
- "geo_region", "geo_county", "geo_parish",
- "contacts_email", "contacts_phone", "contacts_website", "contacts_fax",
- "structure_nature", "structure_capital", "structure_capital_currency",
- "cae", "racius", "portugalio",
- "creditos_used", "creditos_left_month", "creditos_left_day",
- "creditos_left_hour", "creditos_left_minute", "creditos_left_paid",
- "run_id"]
+```
+consulta_nif.py:529 is_nif_recente(nif, dias=30)
+  → SELECT data_consulta FROM nif_pt WHERE nif=? ORDER BY datetime(data_consulta) DESC LIMIT 1
+  → parse _parse_data_consulta() (YYYY-MM-DD HH:MM:SS / ISO / Z)
+  → total_seconds/86400 < 30 ? recente=True : False
+  → se True: registar_ignorado(nif, data_ultima, "cache_recente")
+           → INSERT INTO nif_ignorados (nif, data_ultima_consulta, dias_desde_ultima, motivo)
+           → stdout JSON {ignorado:true, motivo:"cache_recente", data_ultima_consulta, cache_antiguidade_dias, run_id}
+           → importar_nif_sqlite.py:194 if ignorado -> skip INSERT nif_pt
 ```
 
-37 = 38 (`nif_pt`) -1 (`data_consulta` DEFAULT) = 41 (`nif_pt_stg`) -4 (`id`+`data_consulta`+`data_staging`+`processado`). **Match 100%** (inclui `run_id`; `importar_nif.py:223` `mapear_registo(...,run_id)` + `utils/run_id.py:87`). Fallback sem `run_id` se coluna falta (`importar_nif.py:529`).
-
-## 6. Tipos e Tamanhos
+## 5. Tipos e Tamanhos
 
 | Tipo | Uso | Exemplo |
 |------|-----|---------|
-| `NVARCHAR(10/50/100/255/500/MAX)` | Texto | `title NVARCHAR(500)` |
-| `DECIMAL(18,2)` | Capital | `structure_capital` |
-| `BIT` | Boolean | `nif_valido_formato`, `resolvido` |
-| `INT` | Créditos/left | `creditos_left_month` |
-| `DATE` | Data | `start_date` `2010-05-18` |
-| `DATETIME2` | Timestamp | `data_consulta`, `data_erro` |
-| `BIGINT` | NIF/ID | `nif` 9 dígitos, `id IDENTITY` |
-| `TEXT/INTEGER` | SQLite | `dados TEXT`, `resolvido INTEGER` |
+| `INTEGER` | PK, NIF, left, dias | `nif` 9 dígitos, `left_minute`, `dias_desde_ultima` |
+| `TEXT` | JSON, datas, motivo, run_id | `dados TEXT`, `data_consulta TEXT`, `motivo TEXT`, `run_id TEXT` |
+| `DATETIME` | ISO `YYYY-MM-DD HH:MM:SS` | `data_consulta`, `data_tentativa`, `data_ultima_consulta` |
 
-## 7. Estratégia Staging → Prod (futuro)
+> SQLite WAL 3 tabelas — sem `NVARCHAR`, `DECIMAL`, `BIT`, `DATETIME2`, `BIGINT IDENTITY` (esses eram Azure, removido v1.2.0).
 
-```sql
-CREATE INDEX ix_nif_pt_stg_nif_processado
-ON stg_nunotome.nif_pt_stg (nif, processado) WHERE processado=0;
+## 6. Coerência Python ↔ SQL
 
-MERGE stg_nunotome.nif_pt AS target
-USING (SELECT * FROM stg_nunotome.nif_pt_stg WHERE processado=0) AS source
-ON target.nif = source.nif
-WHEN MATCHED THEN UPDATE SET title=source.title, data_consulta=GETDATE(), ...
-WHEN NOT MATCHED THEN INSERT (nif, ...) VALUES (source.nif, ...);
-UPDATE stg_nunotome.nif_pt_stg SET processado=1 WHERE processado=0;
-```
+| Python | SQL | Notas |
+|--------|-----|-------|
+| `importar_nif_sqlite.py:55` `SQL_DDL` | `nif_pt` 5c | `INSERT (nif,dados,data_consulta,run_id)` (`:238`) + fallback sem `run_id` (`:242`) |
+| `utils/error_handler.py:46` `DDL_ERROS` | `nif_api_erros` 15c | `INSERT (...,run_id)` + fallback (`:436`) |
+| `utils/cache_validator.py:43` `DDL_IGNORADOS` | `nif_ignorados` 6c | `INSERT (nif, data_ultima_consulta, dias_desde_ultima, motivo)` (`:379`) + 2 índices |
 
-## 8. Migração `run_id` (`sql/03_migracao_run_id.sql` 39L)
+Todas com `PRAGMA journal_mode=WAL` + `CREATE INDEX IF NOT EXISTS`.
 
-Idempotente para BDs já criadas com `01`/`02` (não faz `DROP`, seguro em prod). Para novas BDs, `01`/`02` já incluem `run_id` — é NO-OP.
+## 7. Histórico DDL
 
-```sql
--- sql/03_migracao_run_id.sql:15
-IF COL_LENGTH('stg_nunotome.nif_pt','run_id') IS NULL ALTER TABLE stg_nunotome.nif_pt ADD run_id NVARCHAR(36) NULL;
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='ix_nif_pt_run_id' ...) CREATE INDEX ix_nif_pt_run_id ON ...;
--- repete para nif_pt_stg (:22) e nif_api_erros (:30)
--- Verificação: SELECT TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE COLUMN_NAME='run_id';
-```
+Ver [ddl-history.md](ddl-history.md). `v1.0.0` adiciona `nif_api_erros` 15c; `v1.1.0` adiciona `run_id` (5/15c); `v1.2.0` adiciona `nif_ignorados` 6c + remove Azure (`sql/0*` + `pyodbc`).
 
-Execução:
+## 8. Referências
 
-```powershell
-sqlcmd -S kiwa-pt-operations.database.windows.net -d kiwa-pt-operations -i sql/03_migracao_run_id.sql
-# SQLite migra automaticamente: PRAGMA table_info + ALTER TABLE ADD COLUMN (importar_nif_sqlite.py:102 / utils/error_handler.py:153)
-```
-
-## 9. Histórico DDL
-
-Ver [ddl-history.md](ddl-history.md). `v1.0.0` adiciona `nif_api_erros` 14c (`sql/02_criar_tabela_erros.sql`); `v1.1.0` adiciona `run_id` (38/41/15c) + `sql/03_migracao_run_id.sql`.
-
-## 10. Referências
-
-* `sql/01_criar_tabelas.sql:8` `CREATE SCHEMA stg_nunotome` + `:80` `run_id`
-* `importar_nif.py:223` `mapear_registo(...,run_id)` 37c · `utils/error_handler.py:46` `DDL_ERROS` 15c run_id · `utils/run_id.py:41` `generate_run_id`
-* `sql/03_migracao_run_id.sql` migração idempotente
-* `docs/technical.md` §6 ER condensado + §10b run_id
+* `importar_nif_sqlite.py:55` `SQL_DDL` + `:95` `WAL` + `:102` migração `run_id`
+* `utils/cache_validator.py:43` `DDL_IGNORADOS` + `:55` `idx_nif` + `:126` `_get_connection()` + `:225` `is_nif_recente()` + `:329` `registar_ignorado()`
+* `utils/error_handler.py:46` `DDL_ERROS` 15c + `:153` migração `run_id`
+* `utils/run_id.py:41` `generate_run_id` · `config/config.yaml:15` `cache_*`
+* `docs/technical.md` §6 ER condensado + §10c cache

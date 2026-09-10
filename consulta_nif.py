@@ -524,6 +524,62 @@ def main():
     if not validar_nif(nif):
         logger_main.warning("[valid] NIF %s falha validação Mod-11, mas request será enviado", nif)
 
+    # --- Validação cache SQLite antes de pedido (config.yaml: cache_ativo + cache_antiguidade_dias) ---
+    # Pesquisa em nif_pt se já existe registo recente; se sim, não faz pedido e regista em nif_ignorados
+    try:
+        from utils.cache_validator import _get_cache_config, init_cache_tables, is_nif_recente, registar_ignorado
+
+        cache_ativo, cache_dias, _ = _get_cache_config()
+        if cache_ativo:
+            # garante tabela ignorados existe (idempotente, fail-open)
+            try:
+                init_cache_tables()
+            except Exception as e:
+                logger_main.warning("[cache] Falha init tabela ignorados: %s", e)
+            recente, data_ultima = is_nif_recente(nif, dias=cache_dias)
+            if recente:
+                # regista tentativa ignorada com data/hora
+                try:
+                    registar_ignorado(nif, data_ultima)
+                except Exception as e:
+                    logger_main.warning("[cache] Falha registar ignorado: %s", e)
+                logger_main.info("[cache] NIF %s ignorado - ultima consulta %s dentro de %d dias", nif, data_ultima, cache_dias)
+                ignorado_payload = {
+                    "nif": nif,
+                    "valido": validar_nif(nif),
+                    "fonte": None,
+                    "erro": None,
+                    "dados": None,
+                    "nif_valido_formato": None,
+                    "creditos": None,
+                    "run_id": _run_id,
+                    "ignorado": True,
+                    "motivo": "cache_recente",
+                    "data_ultima_consulta": data_ultima,
+                    "cache_antiguidade_dias": cache_dias,
+                }
+                print(json.dumps(ignorado_payload, indent=2, ensure_ascii=False))
+                # BOX ignorado
+                logger_main.info("-" * 49)
+                logger_main.info("| NIF ignorado - cache recente                 |")
+                logger_main.info("|---------------------------------------------|")
+                logger_main.info("| NIF         : %-30s |", str(nif))
+                logger_main.info("| Ultima      : %-30s |", str(data_ultima)[:30] if data_ultima else "—")
+                logger_main.info("| Antiguidade : %-30s |", f"{cache_dias} dias")
+                logger_main.info("| run_id      : %-30s |", _run_id[:30])
+                logger_main.info("-" * 49)
+                logger_main.info("[run] run_id=%s", _run_id)
+                logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
+                logger_main.info("=" * 49)
+                logger_main.info(f"{' nif-pt consulta_nif finalizado ':=^49}")
+                logger_main.info("=" * 49)
+                sys.exit(0)
+        else:
+            logger_main.debug("[cache] cache_ativo=false -> validação ignorada")
+    except Exception as e:
+        # fail-open: nunca quebrar fluxo principal por causa do cache
+        logger_main.warning("[cache] Validação cache falhou: %s - prossegue para API", e)
+
     logger_main.debug("-" * 49)
     resultado = consultar_nif(nif, run_id=_run_id)
     print(json.dumps(resultado, indent=2, ensure_ascii=False))

@@ -10,7 +10,225 @@ e este projeto adere a [Semantic Versioning](https://semver.org/lang/pt-PT/).
 
 ## [Unreleased]
 
-> Nada de momento. Ver [`v1.1.0`](#110---2026-09-11) para o último feature `run_id` (`feature/add_runid` → `release/v1.1.0`).
+> Nada de momento. Ver [`v2.0.0`](#200---2026-09-11) para o último **BREAKING** `cache SQLite + remoção Azure SQL` (`feature/cache-sqlite` → `release/v2.0.0`).
+
+---
+
+## [2.0.0] - 2026-09-11
+
+> Branch: `feature/cache-sqlite` → `release/v2.0.0` → `dev`. Tag alvo `v2.0.0`.
+> Base `v1.1.0` (`c14b945` → `v1.1.0` run_id 2026-09-11, merge `feature/add_runid`).
+> SemVer **major** — **BREAKING CHANGE**: remoção total da stack Azure SQL (`importar_nif.py`, `sql/*.sql`, `pyodbc`, `AZURE_*`) + nova feature de cache SQLite (`nif_ignorados`, `utils/cache_validator.py`, `cache_ativo`).
+
+### ⚠️ Breaking Changes
+
+- **Stack Azure SQL descontinuado — migração obrigatória para SQLite** (`BREAKING`):
+  - `importar_nif.py` (576L, mapeamento 37 colunas + `pyodbc` `stg_nunotome.nif_pt_stg`) **apagado** — qualquer `python importar_nif.py`, `import importar_nif` ou pipeline `| python importar_nif.py` quebra com `ModuleNotFoundError` / `FileNotFoundError`.
+  - `sql/01_criar_tabelas.sql`, `sql/02_criar_tabela_erros.sql`, `sql/03_migracao_run_id.sql` **apagados** — DDL Azure (`NVARCHAR(36)`, `IDENTITY`, `sys.indexes`, `COL_LENGTH`) deixa de existir; `sqlcmd -i sql/*.sql` falha.
+  - `requirements.txt:3` — `pyodbc>=5.0.0` **removido** (agora só `requests`, `pyyaml`, `python-dotenv`) — `pip install -r requirements.txt` já não instala ODBC; ambientes que dependem de `import pyodbc` quebram.
+  - `config/config.yaml:bloco importar_nif` — chaves `sql_server`, `sql_database`, `sql_schema`, `sql_driver`, `tabela_staging` **removidas** — `get_config("importar_nif")` agora levanta `ValueError` (blocos válidos só `consulta_nif` e `importar_nif_sqlite`).
+  - `config/config.py:53-110` — `AZURE_USER` / `AZURE_PALAVRA_CHAVE` removidos de `get_config()` (merge `default` + bloco script + `.env` só expõe `NIF_PT_KEY`/`API_TOKEN`), log `***XXXX` sem `AZURE_*`, docstring `Args: script_name` lista só `consulta_nif`/`importar_nif_sqlite`.
+  - `config/.env.example:secção Azure SQL` removida — template agora só `NIF-PT-KEY` (+ `API_TOKEN` opcional); `.env` com `AZURE_*` é ignorado.
+  - `main.py:73-78` BOX ajuda — referência `| python importar_nif.py` removida (agora só `consulta_nif.py | importar_nif_sqlite.py`).
+  - Infra `kiwa-pt-operations` / schema `stg_nunotome` / `ODBC Driver 18 for SQL Server` / tabela `nif_pt_stg` **descontinuados** — sem suporte, sem migração automática.
+
+### Removed
+
+- **`importar_nif.py` — ficheiro completo apagado** (`importar_nif.py:1-576`):
+  - `mapear_registo(resultado, run_id)` 37 colunas (`run_id` 37ª), `colunas_tabela()`/`placeholders()` 37 `?`, `valores_para_insert()`, `main()` com `pyodbc.connect(DRIVER={ODBC Driver 18} SERVER=... DATABASE=... UID=AZURE_USER PWD=AZURE_PALAVRA_CHAVE)`, `INSERT INTO nif_pt_stg (37 cols) VALUES (37 ?)` + fallback `pyodbc.Error` sem `run_id`, `BOX run_id` — tudo removido.
+  - Dependência `import pyodbc` (`importar_nif.py:20` antigo) eliminada do codebase.
+
+- **`sql/*.sql` — DDL Azure apagado**:
+  - `sql/01_criar_tabelas.sql` — `CREATE TABLE stg_nunotome.nif_pt` / `nif_pt_stg` (`run_id NVARCHAR(36) NULL`, `ix_nif_pt_run_id`), `CREATE SCHEMA stg_nunotome`.
+  - `sql/02_criar_tabela_erros.sql` — `CREATE TABLE stg_nunotome.nif_api_erros` (`run_id NVARCHAR(36)`, `ix_nif_api_erros_run_id`).
+  - `sql/03_migracao_run_id.sql` — script idempotente `IF COL_LENGTH(...) IS NULL ALTER TABLE ADD run_id` + `IF NOT EXISTS (sys.indexes) CREATE INDEX` para `nif_pt`/`nif_pt_stg`/`nif_api_erros`.
+
+- **`requirements.txt:4` — `pyodbc>=5.0.0` removido**:
+  - Antes: `requests>=2.31.0`, `pyyaml>=6.0.1`, `python-dotenv>=1.0.0`, `pyodbc>=5.0.0` (4 linhas).
+  - Agora: 3 linhas (`requirements.txt:1-3` — `requests`, `pyyaml`, `python-dotenv`).
+
+- **`config/config.yaml:bloco importar_nif` removido**:
+  - Antes (v1.1.0): bloco `importar_nif:` com `sql_server`, `sql_database`, `sql_schema`, `sql_driver`, `tabela_staging`.
+  - Agora (`config/config.yaml:1-31`): só `default`, `consulta_nif` (`api_base`), `importar_nif_sqlite` (`db_path`, `tabela`).
+
+- **`config/config.py:53-134` — limpeza Azure**:
+  - `get_config()` docstring `Args: script_name` agora `consulta_nif` | `importar_nif_sqlite` (antes incluía `importar_nif`).
+  - Merge `CONFIG_YAML.get("default", {}).copy()` + `CONFIG_YAML.get(script_name, {})` sem chaves `sql_*`.
+  - Segredos só `API_TOKEN` + `NIF_PT_KEY` (`os.getenv("NIF-PT-KEY")` hífen intencional); removido `AZURE_USER = os.getenv("AZURE_USER")` / `AZURE_PALAVRA_CHAVE`.
+  - Log `logger.info("[cfg] Segredos carregados NIF-PT-KEY=***XXXX")` sem `AZURE_*`.
+
+- **`config/.env.example:1-11` — secção Azure removida**:
+  - Antes: bloco `# Azure SQL` com `AZURE_USER`, `AZURE_PALAVRA_CHAVE`, `AZURE_SQL_SERVER`, etc.
+  - Agora: só `NIF-PT-KEY=coloque_a_sua_chave_aqui` + `# API_TOKEN` opcional (11L).
+
+- **`main.py:73-78` — BOX ajuda sem Azure**:
+  - Removido `| python importar_nif.py` do BOX; mantém `| python consulta_nif.py 509442013 |` e `| python consulta_nif.py 509442013 | python importar_nif_sqlite.py |`.
+
+### Added
+
+- **`config/config.yaml:15-18` — defaults de cache SQLite** (`default`):
+  ```yaml
+  cache_ativo: true                 # bool — liga/desliga validação (fail-open se false)
+  cache_antiguidade_dias: 30        # int — janela de recenticidade (dias)
+  cache_tabela_ignorados: "nif_ignorados"  # str — nome tabela ignorados (sanitizado alfanum+_)
+  ```
+  - Lidos via `config/config.py:get_config("consulta_nif")` e fundidos em `default` (shallow merge `config.update(script_config)`); expostos em `cfg.get("cache_ativo")` etc.
+
+- **`utils/cache_validator.py` — novo módulo de cache SQLite (407L)** (`utils/cache_validator.py:1-407`):
+  - **DDL `nif_ignorados`** (`utils/cache_validator.py:44-56`):
+    ```sql
+    CREATE TABLE IF NOT EXISTS nif_ignorados (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        nif                     INTEGER NOT NULL,
+        data_tentativa          TEXT NOT NULL DEFAULT (datetime('now')),
+        data_ultima_consulta    TEXT,
+        dias_desde_ultima       INTEGER,
+        motivo                  TEXT NOT NULL DEFAULT 'cache_recente'
+    );
+    CREATE INDEX IF NOT EXISTS idx_nif_ignorados_nif ON nif_ignorados(nif);
+    CREATE INDEX IF NOT EXISTS idx_nif_ignorados_data ON nif_ignorados(data_tentativa);
+    ```
+    - Suporte a nome custom `cache_tabela_ignorados` via `replace("nif_ignorados", tabela)` sanitizado (`tabela.replace("_","").isalnum()` senão fallback `nif_ignorados`).
+  - **Helpers privados** (`utils/cache_validator.py:61-160`):
+    - `_get_config() -> dict` — `from config.config import get_config; cfg=get_config("consulta_nif")` com `try/except` → `{}` + `logger.warning("[cache] Falha a ler config")` (fail-open).
+    - `_get_db_path() -> Path` — resolve `cfg.get("db_path","data/nif_pt.db")` relativo a `Path(__file__).parent.parent` → absoluto, `db_path.parent.mkdir(parents=True)`.
+    - `_get_cache_config() -> tuple[bool,int,str]` — `(cache_ativo:bool, cache_antiguidade_dias:int, cache_tabela_ignorados:str)` com `int()` + fallback `30`, sanitização nome.
+    - `_get_connection() -> sqlite3.Connection` — `sqlite3.connect(str(db_path))`, `PRAGMA journal_mode=WAL` (logado), `executescript(DDL_IGNORADOS)` + `execute(idx_nif/idx_data)` + `commit`, `logger.debug("[cache] DDL %s garantido")`.
+    - `_parse_data_consulta(val: str|None) -> datetime|None` (`utils/cache_validator.py:188-219`) — parse `"%Y-%m-%d %H:%M:%S"`, `"%Y-%m-%d %H:%M:%S.%f"`, `"%Y-%m-%dT%H:%M:%S"`, `"%Y-%m-%dT%H:%M:%S.%f"` + fallback `datetime.fromisoformat(s.replace("Z","").replace("T"," "))`, `None` se vazio/inválido.
+  - **API pública**:
+    - `init_cache_tables() -> None` (`utils/cache_validator.py:163-182`) — idempotente, `logger.debug("~ init_cache_tables() ~")`, `t=time.perf_counter()`, `_get_connection().close()`, `logger.debug("[cache] init_cache_tables() -> %.2fs")`.
+    - `is_nif_recente(nif: str|int, dias: int|None=None) -> tuple[bool, str|None]` (`utils/cache_validator.py:225-326`) — `SELECT data_consulta FROM nif_pt WHERE nif=? ORDER BY datetime(data_consulta) DESC LIMIT 1`, compara `agora - dt_ultima` com `total_seconds()/86400 < dias` (precisão horas), `total_dias<0` (relógio futuro) → `True` por segurança, `dias<=0` → `False`, `nif_pt` inexistente / sem registo / parse fail → `(False,None)` (fail-open), TAG `[cache]` + TIMING R9, `logger.info("[cache] NIF %s ultima=%s dias_desde=%d antiguidade=%d recente=%s")`.
+    - `registar_ignorado(nif, data_ultima_consulta, motivo="cache_recente") -> int|None` (`utils/cache_validator.py:329-407`) — calcula `dias_desde_ultima = (now - _parse_data_consulta(data_ultima_consulta)).days`, `INSERT INTO {tabela} (nif, data_ultima_consulta, dias_desde_ultima, motivo) VALUES (?,?,?,?)`, `cur.lastrowid`, `logger.info("[cache] Ignorado registado id=%s nif=%s ultima=%s dias_desde=%s")`, `rollback` + `logger.error("[cache] Falha ao registar")` em `sqlite3.Error`.
+
+- **Pipeline cache — sem consumo de créditos em NIFs recentes** (ver `Changed`).
+
+### Changed
+
+- **`config/config.py:52-134` — só SQLite**:
+  - Docstring topo `Notas: NIF-PT-KEY com hífen` mantém; `get_config()` docstring `script_name` enum agora `consulta_nif`/`importar_nif_sqlite` + `See Also: utils.cache_validator (lê cache_*)` (`config/config.py:96-97`).
+  - `logger.info("[cfg] Segredos carregados NIF-PT-KEY=***{last4}")` + `logger.warning("[cfg] NIF-PT-KEY com hífen não encontrada")` sem `AZURE_*`.
+  - `logger.debug("[cfg] get_config(%s) merge default+script keys=%s")` inclui `cache_ativo`, `cache_antiguidade_dias`, `cache_tabela_ignorados` quando `script_name=="consulta_nif"`.
+
+- **`consulta_nif.py:main()` — validação cache antes de `consultar_nif` — `sys.exit(0)` sem GET** (`consulta_nif.py:527-581`):
+  - Após `validar_nif(nif)` e antes de `consultar_nif(nif, run_id)`:
+    ```python
+    from utils.cache_validator import _get_cache_config, init_cache_tables, is_nif_recente, registar_ignorado
+    cache_ativo, cache_dias, _ = _get_cache_config()  # default true/30/nif_ignorados
+    if cache_ativo:
+        init_cache_tables()  # idempotente, fail-open
+        recente, data_ultima = is_nif_recente(nif, dias=cache_dias)
+        if recente:
+            registar_ignorado(nif, data_ultima)  # motivo cache_recente
+            logger.info("[cache] NIF %s ignorado - ultima consulta %s dentro de %d dias", nif, data_ultima, cache_dias)
+            print(json.dumps({"nif":nif,"valido":validar_nif(nif),"fonte":None,"erro":None,"dados":None,
+                              "ignorado":True,"motivo":"cache_recente","data_ultima_consulta":data_ultima,
+                              "cache_antiguidade_dias":cache_dias,"run_id":_run_id}, indent=2, ensure_ascii=False))
+            # BOX NIF ignorado
+            logger.info("| NIF ignorado - cache recente                 |")
+            sys.exit(0)  # sem GET à API (fail-open, não consome créditos)
+    ```
+  - `else: logger.debug("[cache] cache_ativo=false -> validação ignorada")`.
+  - `except Exception as e: logger.warning("[cache] Validação cache falhou: %s - prossegue para API")` — **fail-open**: qualquer falha de BD/config não quebra fluxo, prossegue para `consultar_nif` normal.
+  - `stdout` JSON ignorado contém `ignorado:true`, `motivo:cache_recente`, `data_ultima_consulta` (ISO `YYYY-MM-DD HH:MM:SS` de `nif_pt.data_consulta`), `cache_antiguidade_dias`, `run_id` (herdado/propagado), `fonte:None`, `dados:None` — compatível com `importar_nif_sqlite.py` early skip.
+  - BOX `| NIF ignorado - cache recente |` com `| NIF : |`, `| Ultima : |`, `| Antiguidade : 30 dias |`, `| run_id : |` + `logger.info("[run] run_id=%s")` + TIMING.
+
+- **`importar_nif_sqlite.py:main()` — early skip se `resultado.get('ignorado')`** (`importar_nif_sqlite.py:193-208`):
+  - Após `ensure_run_id(cli>payload)` e antes de `if resultado.get("erro")`:
+    ```python
+    if resultado.get("ignorado"):
+        logger.info("[cache] NIF %s ignorado (cache_recente) ultima=%s run_id=%s - skip INSERT", nif, data_ultima, _run_id[:8])
+        logger.info("| NIF ignorado - skip SQLite                         |")
+        sys.exit(0)
+    ```
+  - Log `logger.info("[cache] skip INSERT")` + BOX `| NIF ignorado - skip SQLite |` com `NIF`, `Ultima`, `run_id`; `sys.exit(0)` sem `get_db()`/`INSERT` — evita duplicar `nif_pt` e preserva `run_id` da execução do `consulta_nif`.
+  - Fluxo normal `INSERT INTO nif_pt (nif,dados,data_consulta,run_id) VALUES (?,?,?,?)` inalterado para casos não ignorados.
+
+- **`main.py:73-78` — BOX sem Azure** (`main.py:73-78`):
+  - Mantém `BANNER_APP = 49`, `BOX | ... |`, `TAG [cli][run]`, `TIMING %.2fs`; remove linha `| python importar_nif.py` (ver `Removed`).
+
+### Notas de Migração — v1.1.0 → v2.0.0
+
+> **BREAKING — ação obrigatória antes de `pip install -r requirements.txt` ou `python consulta_nif.py`:**
+
+```bash
+# 1. Remover dependência Azure (se instalada)
+pip uninstall pyodbc -y
+pip install -r requirements.txt  # agora só requests, pyyaml, python-dotenv
+
+# 2. Remover referências a importar_nif.py / AZURE_* do teu código/CI
+grep -r "importar_nif" --include="*.py" --include="*.sh" --include="*.yaml" .
+grep -r "AZURE_" --include="*.py" --include="*.env*" .
+grep -r "pyodbc" --include="*.py" --include="*.txt" .
+# substituir:
+#   python consulta_nif.py 509442013 | python importar_nif.py
+# por:
+#   python consulta_nif.py 509442013 | python importar_nif_sqlite.py
+# ou
+#   python consulta_nif.py 509442013 --run-id <uuid> | python importar_nif_sqlite.py --run-id <uuid>
+
+# 3. Limpar config.yaml — garantir que não existe bloco importar_nif
+#    válido só: default, consulta_nif, importar_nif_sqlite
+cat config/config.yaml
+# deve conter cache_ativo/cache_antiguidade_dias/cache_tabela_ignorados em default
+
+# 4. Limpar .env — remover AZURE_USER, AZURE_PALAVRA_CHAVE, AZURE_SQL_*
+cat config/.env
+# deve conter só NIF-PT-KEY (com hífen!) e opcional API_TOKEN
+
+# 5. DDL Azure já não é necessário — sql/*.sql apagados
+#    Se precisas de histórico, recuperar de git: git show v1.1.0:sql/01_criar_tabelas.sql
+
+# 6. Verificar get_config() válido
+python -c "from config.config import get_config; print(get_config('consulta_nif').keys())"
+python -c "from config.config import get_config; get_config('importar_nif')"  # deve levantar ValueError
+
+# 7. Pipeline com cache (default 30 dias) — sem GET se recente
+python consulta_nif.py 509442013 | python importar_nif_sqlite.py
+# 1ª vez: GET nif.pt -> INSERT nif_pt -> 1 row
+# 2ª vez (<30d): [cache] NIF ignorado -> stdout {"ignorado":true,"motivo":"cache_recente"} -> skip INSERT (0 créditos)
+cat data/nif_pt.db | sqlite3 "SELECT nif, data_consulta, run_id FROM nif_pt ORDER BY data_consulta DESC LIMIT 5;"
+sqlite3 data/nif_pt.db "SELECT nif, data_tentativa, data_ultima_consulta, dias_desde_ultima, motivo FROM nif_ignorados ORDER BY data_tentativa DESC LIMIT 5;"
+
+# Desativar cache se precisas forçar consulta (ex: NIF com dados desatualizados)
+# config/config.yaml:
+#   default:
+#     cache_ativo: false
+# ou por execução: editar yaml temporariamente; não há flag CLI (fail-open mantém compat)
+
+# Ajustar janela
+#   cache_antiguidade_dias: 7   # mais agressivo (7d)
+#   cache_antiguidade_dias: 0   # desativa recenticidade (sempre consulta; dias<=0 -> nunca recente)
+
+# Tabela ignorados custom
+#   cache_tabela_ignorados: "nif_ignorados_audit"
+#   -> DDL cria nif_ignorados_audit com mesmos índices idx_nif_ignorados_audit_nif/data
+
+# Verificação cache
+python -c "from utils.cache_validator import is_nif_recente, _get_cache_config; print(_get_cache_config()); print(is_nif_recente('509442013', dias=30))"
+python -c "from utils.cache_validator import init_cache_tables; init_cache_tables(); print('DDL nif_ignorados OK')"
+```
+
+```sql
+-- SQLite — inspeção (WAL)
+SELECT name FROM sqlite_master WHERE type='table' AND name IN ('nif_pt','nif_ignorados','nif_api_erros');
+PRAGMA table_info(nif_ignorados);
+-- id INTEGER PK, nif INTEGER, data_tentativa TEXT DEFAULT datetime('now'), data_ultima_consulta TEXT, dias_desde_ultima INTEGER, motivo TEXT DEFAULT 'cache_recente'
+SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='nif_ignorados';
+-- idx_nif_ignorados_nif ON nif_ignorados(nif)
+-- idx_nif_ignorados_data ON nif_ignorados(data_tentativa)
+SELECT nif, datetime(data_ultima_consulta), dias_desde_ultima, motivo, datetime(data_tentativa) FROM nif_ignorados ORDER BY data_tentativa DESC LIMIT 10;
+SELECT nif, datetime(data_consulta), substr(run_id,1,8) FROM nif_pt ORDER BY datetime(data_consulta) DESC LIMIT 10;
+
+-- Limpeza manual se necessário (ex: forçar reconsulta)
+DELETE FROM nif_ignorados WHERE nif=509442013;
+DELETE FROM nif_pt WHERE nif=509442013; -- próxima consulta fará GET
+```
+
+```bash
+# Rollback para v1.1.0 (com Azure) — se necessário
+git checkout v1.1.0 -- importar_nif.py sql/ requirements.txt config/config.yaml config/config.py config/.env.example main.py
+pip install "pyodbc>=5.0.0"
+```
 
 ---
 
@@ -217,7 +435,8 @@ CREATE TABLE nif_pt (id INTEGER PRIMARY KEY AUTOINCREMENT, nif INTEGER NOT NULL,
 
 ## Links comparativos
 
-[Unreleased]: https://github.com/nunoetome/nif-pt/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/nunoetome/nif-pt/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/nunoetome/nif-pt/compare/v1.1.0...v2.0.0
 [1.1.0]: https://github.com/nunoetome/nif-pt/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/nunoetome/nif-pt/compare/v0.2.0-beta...v1.0.0
 [0.2.0-beta]: https://github.com/nunoetome/nif-pt/compare/v.0.1.0-alpha...v0.2.0-beta

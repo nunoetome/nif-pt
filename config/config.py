@@ -56,16 +56,15 @@ def get_config(script_name: str) -> dict:
     Combina, por ordem de precedência crescente:
 
     1. ``default`` de ``config.yaml`` — chaves comuns (``retry_count``,
-       ``timeout``, ``tempo_*``, ``max_tentativas_*``).
+       ``timeout``, ``tempo_*``, ``max_tentativas_*``, ``cache_*``).
     2. Bloco específico ``config.yaml[script_name]`` (``consulta_nif``,
-       ``importar_nif_sqlite``, ``importar_nif``) — faz *shallow merge*
+       ``importar_nif_sqlite``) — faz *shallow merge*
        ``config.update(script_config)``.
-    3. Segredos de ``config/.env`` — ``AZURE_USER``,
-       ``AZURE_PALAVRA_CHAVE``, ``API_TOKEN``, ``NIF-PT-KEY`` (com hífen).
+    3. Segredos de ``config/.env`` — ``API_TOKEN``, ``NIF-PT-KEY`` (com hífen).
 
     Args:
         script_name: Nome do bloco em ``config.yaml``. Valores válidos:
-            ``"consulta_nif"``, ``"importar_nif_sqlite"``, ``"importar_nif"``.
+            ``"consulta_nif"``, ``"importar_nif_sqlite"``.
             Qualquer outro levanta ``ValueError``.
 
     Returns:
@@ -73,11 +72,10 @@ def get_config(script_name: str) -> dict:
         presentes (``None`` se ``.env`` não definir):
 
         * ``NIF_PT_KEY`` — ``os.getenv("NIF-PT-KEY")`` (hífen!)
-        * ``AZURE_USER`` / ``AZURE_PALAVRA_CHAVE`` — credenciais Azure SQL
         * ``API_TOKEN`` — opcional, futuro
 
         Mais todas as chaves de ``default`` + bloco do script
-        (``api_base``, ``db_path``, ``sql_server`` …).
+        (``api_base``, ``db_path``, ``cache_*`` …).
 
     Raises:
         ValueError: Se ``script_name`` não existe em ``config.yaml``.
@@ -89,19 +87,17 @@ def get_config(script_name: str) -> dict:
         'http://www.nif.pt'
         >>> get_config("importar_nif_sqlite")["db_path"]
         'data/nif_pt.db'
-        >>> get_config("importar_nif")["sql_schema"]
-        'stg_nunotome'
         >>> get_config("inexistente")  # doctest: +SKIP
         Traceback (most recent call last):
         ValueError: Configuração para o script 'inexistente' não encontrada
 
     See Also:
-        :mod:`consulta_nif`, :mod:`importar_nif`, :mod:`importar_nif_sqlite`,
-        :mod:`utils.error_handler` (lê ``tempo_espera_*`` e ``max_tentativas_*``).
+        :mod:`consulta_nif`, :mod:`importar_nif_sqlite`,
+        :mod:`utils.error_handler` (lê ``tempo_espera_*`` e ``max_tentativas_*``),
+        :mod:`utils.cache_validator` (lê ``cache_*``).
 
     Notas:
-        * Loga ``[cfg] Segredos carregados AZURE_USER=OK/MISSING
-          NIF-PT-KEY=***XXXX`` sem expor valores.
+        * Loga ``[cfg] Segredos carregados NIF-PT-KEY=***XXXX`` sem expor valores.
         * Aviso se ``NIF-PT-KEY`` falta.
         * TIMING ``%.2fs`` (R9) com ``time.perf_counter``.
     """
@@ -120,8 +116,6 @@ def get_config(script_name: str) -> dict:
         logger.debug("[cfg] get_config(%s) merge default+script keys=%s", script_name, list(config.keys()))
 
     # Adiciona segredos do .env
-    config["AZURE_USER"] = os.getenv("AZURE_USER")
-    config["AZURE_PALAVRA_CHAVE"] = os.getenv("AZURE_PALAVRA_CHAVE")
     config["API_TOKEN"] = os.getenv("API_TOKEN")
     config["NIF_PT_KEY"] = os.getenv("NIF-PT-KEY")
 
@@ -129,8 +123,7 @@ def get_config(script_name: str) -> dict:
     nif_key = config["NIF_PT_KEY"]
     masked_key = f"***{nif_key[-4:]}" if nif_key and len(nif_key) >= 4 else ("***" if nif_key else "MISSING")
     logger.info(
-        "[cfg] Segredos carregados AZURE_USER=%s NIF-PT-KEY=%s",
-        "OK" if config["AZURE_USER"] else "MISSING",
+        "[cfg] Segredos carregados NIF-PT-KEY=%s",
         masked_key,
     )
     if not nif_key:

@@ -190,6 +190,23 @@ def main():
         logger_main.info("[run] run_id=%s (herdado do JSON)", _run_id)
         set_run_id(_run_id)
 
+    # NIF ignorado por cache recente — não insere, apenas loga
+    if resultado.get("ignorado"):
+        logger_main.info("[cache] NIF %s ignorado (cache_recente) ultima=%s run_id=%s - skip INSERT", resultado.get("nif"), resultado.get("data_ultima_consulta"), _run_id[:8])
+        logger_main.info("-" * 49)
+        logger_main.info("| NIF ignorado - skip SQLite                         |")
+        logger_main.info("|---------------------------------------------|")
+        logger_main.info("| NIF         : %-30s |", str(resultado.get("nif")))
+        logger_main.info("| Ultima      : %-30s |", str(resultado.get("data_ultima_consulta") or "—")[:30])
+        logger_main.info("| run_id      : %-30s |", _run_id[:30])
+        logger_main.info("-" * 49)
+        logger_main.info("[run] run_id=%s", _run_id)
+        logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
+        logger_main.info("=" * 49)
+        logger_main.info(f"{' nif-pt importar_nif_sqlite finalizado ':=^49}")
+        logger_main.info("=" * 49)
+        sys.exit(0)
+
     if resultado.get("erro"):
         logger_main.warning("[api] Erro consulta propagado: %s run_id=%s", resultado["erro"], _run_id[:8])
         logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)

@@ -2,9 +2,9 @@
 """
 main — Ponto de entrada orquestrador (stub) do nif-pt.
 
-Futuro: ``argparse --nif --to {sqlite,azure,both} --file`` para orquestrar
-:mod:`consulta_nif` + :mod:`importar_nif_sqlite` / :mod:`importar_nif` sem
-``tee``. Atual: demonstra ``BANNER_APP`` + ``BOX`` + logging com
+Futuro: ``argparse --nif --to sqlite --file`` para orquestrar
+:mod:`consulta_nif` + :mod:`importar_nif_sqlite` sem ``tee``. Atual:
+demonstra ``BANNER_APP`` + ``BOX`` + logging com
 :mod:`Logging.logging_orchestrator`.
 
 Uso:
@@ -19,7 +19,7 @@ Exemplos:
     NIF.pt - Recolha de dados
 
 See Also:
-    :mod:`consulta_nif`, :mod:`importar_nif`, :mod:`importar_nif_sqlite`,
+    :mod:`consulta_nif`, :mod:`importar_nif_sqlite`,
     :mod:`Logging.logging_orchestrator`
 """
 
@@ -75,7 +75,6 @@ def main():
     logger_main.info("|-------------------------------------------------|")
     logger_main.info("| python consulta_nif.py 509442013               |")
     logger_main.info("| python consulta_nif.py 509442013 | python importar_nif_sqlite.py |")
-    logger_main.info("| python consulta_nif.py 509442013 | python importar_nif.py |")
     logger_main.info("-" * 49)
 
     logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)

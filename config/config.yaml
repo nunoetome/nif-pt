@@ -12,6 +12,10 @@ default:
   max_tentativas_dia: 0
   max_tentativas_mes: 0
   max_tentativas_paid: 0
+  # Validação cache SQLite — evita pedidos repetidos para NIFs recentes
+  cache_ativo: true
+  cache_antiguidade_dias: 30
+  cache_tabela_ignorados: "nif_ignorados"
 
 # ==============================================================================
 # consulta_nif.py — consulta à API pública nif.pt
@@ -25,13 +29,3 @@ consulta_nif:
 importar_nif_sqlite:
   db_path: "data/nif_pt.db"
   tabela: "nif_pt"
-
-# ==============================================================================
-# importar_nif.py — importação para Azure SQL
-# ==============================================================================
-importar_nif:
-  sql_server: "kiwa-pt-operations.database.windows.net"
-  sql_database: "kiwa-pt-operations"
-  sql_schema: "stg_nunotome"
-  sql_driver: "ODBC Driver 18 for SQL Server"
-  tabela_staging: "nif_pt_stg"
