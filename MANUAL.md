@@ -1,6 +1,6 @@
-# Manual de Instruções — nif-pt v1.0.0
+# Manual de Instruções — nif-pt v1.1.0 (run_id)
 
-> Ferramenta Python para consulta de NIFs portugueses via [nif.pt](http://www.nif.pt) (`?json=1`) com validação Mod-11, pipeline Unix e persistência SQLite WAL / Azure SQL + camada resiliente de rate-limit.
+> Ferramenta Python para consulta de NIFs portugueses via [nif.pt](http://www.nif.pt) (`?json=1`) com validação Mod-11, pipeline Unix e persistência SQLite WAL / Azure SQL + camada resiliente de rate-limit + **rastreabilidade `run_id` (UUID v4) por execução**.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Version](https://img.shields.io/badge/version-v1.0.0-blue.svg)](CHANGELOG.md)
@@ -33,28 +33,30 @@
 
 `nif-pt` consulta a base pública do portal `nif.pt` (`GET ?json=1&q=<NIF>&key=<KEY>`) e guarda o resultado localmente (SQLite WAL) e/ou remotamente (Azure SQL). Destina-se a pessoas coletivas com registo público; NIFs de pessoas singulares ou recentes podem devolver `No records found`.
 
-Novidade `v1.0.0`: camada `utils/error_handler.py` (612L) classifica erros de quota, persiste em `nif_api_erros` (dual SQLite/Azure) e aplica `retry 60s` (minuto) / `3600s` (hora) com limites `max_tentativas_global 5 / minuto 3 / hora 2 / dia 0 / mes 0`.
+Novidade `v1.0.0`: camada `utils/error_handler.py` (806L) classifica erros de quota, persiste em `nif_api_erros` (dual SQLite/Azure, 15c com `run_id`) e aplica `retry 60s` (minuto) / `3600s` (hora) com limites `max_tentativas_global 5 / minuto 3 / hora 2 / dia 0 / mes 0`.
+Novidade `v1.1.0`: **rastreabilidade `run_id`** — `utils/run_id.py` (191L) `generate_run_id()` UUID v4 + `ContextVar` + `ensure_run_id(CLI>payload>ctx>gen)`, `consulta_nif.py:consultar_nif(nif, run_id)` inclui `run_id` em todos os JSON, `importar_nif(_sqlite).py` persiste `run_id` (5c/38c/41c/15c) com `ALTER TABLE` idempotente + `INDEX run_id`, CLI `--run-id` determinístico, migração `sql/03_migracao_run_id.sql`.
 
 ### 1.2 Funcionalidades
 
 | ID | Funcionalidade | Estado | Ficheiro |
 |----|----------------|--------|----------|
-| RF-01 | Validar NIF Mod-11 | ✅ | `consulta_nif.py:48` `validar_nif()` |
-| RF-02 | Consultar `nif.pt` (`?json=1&q=&key=`, timeout 10s) | ✅ | `consulta_nif.py:113` `requests.get` |
-| RF-03 | JSON normalizado (`valido/fonte/erro/dados/creditos/tipo_erro`) | ✅ | `consulta_nif.py:257` |
-| RF-04 | Guardar JSON bruto SQLite WAL | ✅ | `importar_nif_sqlite.py:42` `get_db()` |
-| RF-05 | Normalizar 36 cols → Azure `nif_pt_stg` | ✅ | `importar_nif.py:103` `mapear_registo()` |
-| RF-06 | Pipeline `stdin/stdout` + `exit 0/1` | ✅ | `sys.stdin.read()` |
-| RF-07 | Camada `error_handler` (6 tipos, retry/abort, `nif_api_erros`) | ✅ | `utils/error_handler.py:346` `tratar_erro()` |
-| RF-08 | Logging R1-R9 `<<nif-pt>>` `RotatingFileHandler` 10MB/5000/10 | ✅ | `Logging/logging_orchestrator.py:226` |
+| RF-01 | Validar NIF Mod-11 | ✅ | `consulta_nif.py:99` `validar_nif()` |
+| RF-02 | Consultar `nif.pt` (`?json=1&q=&key=`, timeout 10s) | ✅ | `consulta_nif.py:272` `requests.get` |
+| RF-03 | JSON normalizado (`valido/fonte/erro/dados/creditos/tipo_erro/run_id`) | ✅ | `consulta_nif.py:237` + `utils/run_id.py:87` |
+| RF-04 | Guardar JSON bruto SQLite WAL (5c com `run_id`) | ✅ | `importar_nif_sqlite.py:66` `get_db()` + `utils/run_id.py:185` |
+| RF-05 | Normalizar 37 cols (36+`run_id`) → Azure `nif_pt_stg` | ✅ | `importar_nif.py:223` `mapear_registo(...,run_id)` |
+| RF-06 | Pipeline `stdin/stdout` + `exit 0/1` com `run_id` | ✅ | `sys.stdin.read()` + `utils/run_id.py:132` `--run-id` |
+| RF-07 | Camada `error_handler` (6 tipos, retry/abort, `nif_api_erros` 15c `run_id`) | ✅ | `utils/error_handler.py:515` `tratar_erro(...,run_id)` |
+| RF-08 | Logging R1-R9 `<<nif-pt>>` `RotatingFileHandler` 10MB/5000/10 + TAG `[run]` | ✅ | `Logging/logging_orchestrator.py:226` |
 | RF-09 | `help()` PEP 257 em todos os módulos | ✅ | `docs/api/help.md` |
+| RF-10 | Rastreabilidade `run_id` UUID v4 por execução (geração+propagação+persistência+`--run-id`+migração) | ✅ | `utils/run_id.py:41` `generate_run_id()` + `sql/03_migracao_run_id.sql` |
 
 ### 1.3 Requisitos não-funcionais
 
-* **Performance:** `timeout 10s` (`config.yaml:3`), `WAL`, `sleep 60s/3600s` em retry.
+* **Performance:** `timeout 10s` (`config.yaml:3`), `WAL`, `sleep 60s/3600s` em retry, índices `run_id`.
 * **Segurança:** segredos só em `config/.env` (`.gitignore`), `NIF-PT-KEY` mascarada `***XXXX` em todos os logs.
-* **Portabilidade:** `pathlib`, `pyodbc` ODBC 18, dual PowerShell 5.1 / Bash.
-* **Observabilidade:** `log_files/nif_pt.log` com BOX `| NIF : ... |` + TAG `[api][valid][cfg][db][sqlite][io][map][erro][rate-limit]` + TIMING `%.2fs`.
+* **Portabilidade:** `pathlib`, `pyodbc` ODBC 18, dual PowerShell 5.1 / Bash, `ContextVar` para `run_id`.
+* **Observabilidade:** `log_files/nif_pt.log` com BOX `| NIF : ... |` + `| run_id : ... |` + TAG `[api][valid][cfg][db][sqlite][io][map][erro][rate-limit][run]` + TIMING `%.2fs` + `run_id` em todos os `INSERT`.
 
 ### 1.4 Público-alvo e limitações
 
@@ -66,7 +68,8 @@ Operações, compliance, data engineering. `nif.pt` é agregadora — pode estar
 |--------|------|----------|
 | `v.0.1.0-alpha` | 2026-06-26 | Fundação `consulta_nif` + `importar_nif` + SQLite + DDL Azure |
 | `v0.2.0-beta` | 2026-06-26 | Config centralizada, SQLite JSON bruto, `MANUAL` 310L |
-| `v1.0.0` **(esta)** | 2026-09-10 | `error_handler` 612L + `nif_api_erros` dual + `logging_orchestrator` 580L + `timeout 10s` + `max_tentativas_*` + docs 15 caps |
+| `v1.1.0` **(esta)** | 2026-09-10 | `run_id` UUID v4 191L + `consulta_nif(nif,run_id)` + importadores 37c/5c + `error_handler` 15c `run_id` + `sql/03_migracao_run_id.sql` + `--run-id` |
+| `v1.0.0` | 2026-09-10 | `error_handler` 806L + `nif_api_erros` dual + `logging_orchestrator` 580L + `timeout 10s` + `max_tentativas_*` + docs 15 caps |
 
 Ver [CHANGELOG.md](CHANGELOG.md) completo.
 
@@ -78,15 +81,16 @@ Ver [CHANGELOG.md](CHANGELOG.md) completo.
 
 ```mermaid
 graph LR
-    U[Utilizador<br/>NIF 9 dígitos] --> C[consulta_nif.py<br/>validar_nif + requests<br/>tratar_erro]
-    C -->|stdout JSON<br/>ensure_ascii=False| S[importar_nif_sqlite.py<br/>JSON bruto WAL]
-    C -->|stdout JSON| A[importar_nif.py<br/>36 cols pyodbc]
-    C -->|erro classificado| E[(nif_api_erros<br/>SQLite + Azure)]
-    S --> DB1[(data/nif_pt.db<br/>nif_pt 4c + nif_api_erros 14c<br/>PRAGMA WAL)]
-    A --> DB2[(Azure SQL<br/>stg_nunotome.nif_pt_stg 40c)]
-    DB2 -. MERGE futuro .-> DB3[(stg_nunotome.nif_pt 37c PK nif)]
+    U[Utilizador<br/>NIF 9 dígitos --run-id] --> C[consulta_nif.py<br/>validar_nif + requests<br/>tratar_erro + run_id UUID v4]
+    C -->|stdout JSON run_id<br/>ensure_ascii=False| S[importar_nif_sqlite.py<br/>JSON bruto WAL 5c run_id]
+    C -->|stdout JSON run_id| A[importar_nif.py<br/>37 cols pyodbc run_id]
+    C -->|erro classificado run_id| E[(nif_api_erros<br/>SQLite 15c + Azure 15c run_id)]
+    S --> DB1[(data/nif_pt.db<br/>nif_pt 5c + nif_api_erros 15c<br/>PRAGMA WAL + idx run_id)]
+    A --> DB2[(Azure SQL<br/>stg_nunotome.nif_pt_stg 41c run_id)]
+    DB2 -. MERGE futuro .-> DB3[(stg_nunotome.nif_pt 38c PK nif run_id)]
+    R[utils/run_id.py<br/>generate_run_id + ContextVar<br/>ensure CLI>payload>ctx>gen] -. run_id .-> C & S & A & E
     CFG[config.yaml 37L + .env<br/>get_config merge] -.-> C & S & A & E
-    LOG[logging_orchestrator<br/>R1-R9 <<nif-pt>>] -.-> C & S & A & E
+    LOG[logging_orchestrator<br/>R1-R9 <<nif-pt>> [run]] -.-> C & S & A & E
 ```
 
 Fonte única: [docs/technical.md](docs/technical.md) + [docs/architecture/diagrams.md](docs/architecture/diagrams.md).
@@ -94,14 +98,15 @@ Fonte única: [docs/technical.md](docs/technical.md) + [docs/architecture/diagra
 ### 2.2 Pipeline `stdin`/`stdout`
 
 ```
-consulta_nif.py  ──JSON──>  importar_nif_sqlite.py  (SQLite WAL)
-                 ──JSON──>  importar_nif.py         (Azure SQL staging)
-                 ──erro──>  nif_api_erros           (auditoria)
+consulta_nif.py  ──JSON run_id──>  importar_nif_sqlite.py  (SQLite WAL 5c)
+                 ──JSON run_id──>  importar_nif.py         (Azure SQL staging 37c)
+                 ──erro run_id──>  nif_api_erros           (auditoria 15c)
 ```
+Precedência `run_id`: `CLI --run-id` > `payload JSON run_id` > `ContextVar` > `uuid4` (`utils/run_id.py:87` `ensure_run_id()`); `main.py:60` `ensure_run_id()` por execução.
 
-* `consulta_nif.py` só JSON em `stdout` (`consulta_nif.py:318` `json.dumps(..., indent=2, ensure_ascii=False)`); humanos em `stderr` (`<<nif-pt>>`).
-* Importadores `sys.stdin.read()` → `json.loads` → `INSERT`; falham `exit 1` se `stdin` vazio ou `resultado.erro` existe (propagam erro sem inserir).
-* `nif_api_erros` persiste **sempre** antes de decidir `retry/abort` (ver §10).
+* `consulta_nif.py` só JSON em `stdout` (`consulta_nif.py:529` `json.dumps(..., indent=2, ensure_ascii=False)`) com campo `run_id` UUID v4; humanos em `stderr` (`<<nif-pt>>` + `[run]`).
+* Importadores `sys.stdin.read()` → `json.loads` → `ensure_run_id(CLI>payload>ctx>gen)` (`importar_nif_sqlite.py:185` / `importar_nif.py:455`) → `INSERT (...,run_id)`; falham `exit 1` se `stdin` vazio ou `resultado.erro` existe (propagam erro sem inserir). Se `run_id` ausente no JSON, geram novo e avisam `warning [run] run_id ausente`.
+* `nif_api_erros` persiste **sempre** antes de decidir `retry/abort` com `run_id` (`utils/error_handler.py:368` `guardar_erro(...,run_id)`) (ver §10).
 
 ### 2.3 Centralização de configuração
 
@@ -119,7 +124,42 @@ TIMEOUT  = cfg.get("timeout", 10)
 MAX_GLOBAL = cfg.get("max_tentativas_global", 5)
 ```
 
-### 2.4 Camada de erros (v1.0.0)
+### 2.4a Rastreabilidade `run_id` (v1.1.0)
+
+`utils/run_id.py` (191L):
+
+| Função | Linha | Descrição |
+|--------|-------|-----------|
+| `generate_run_id()` | `:41` | `str(uuid.uuid4())` — 36 chars, 4 hífens, `logger.debug [run]` |
+| `set_run_id` / `get_run_id` | `:59` / `:78` | `ContextVar[str|None] _run_id_ctx` thread-safe |
+| `ensure_run_id(cli_value, payload_value)` | `:87` | Precedência `CLI > payload > ContextVar > geração` + `set_run_id` |
+| `extract_cli_run_id(argv)` | `:132` | Parse `--run-id UUID` e `--run-id=UUID` sem `argparse` |
+| `remove_run_id_args(argv)` | `:163` | Cópia `argv` sem `--run-id` para `isdigit` posicional |
+
+**Fluxo por script:**
+
+* `consulta_nif.py:481` `main()` → `cli_run_id=extract_cli_run_id()` → `_run_id=ensure_run_id(cli_value)` → `logger_main.info("[run] run_id=%s", _run_id)` → `consultar_nif(nif, run_id=_run_id)` (`:238` resolve `run_id or get_run_id() or generate_run_id()` e inclui `run_id` em todos os `return`).
+* `importar_nif_sqlite.py:158` / `importar_nif.py:429` → `cli_run_id=extract_cli_run_id()` → `if cli_run_id: set_run_id(...)` → após `json.loads` → `ensure_run_id(cli_value, payload_value=resultado.get("run_id"))` → `INSERT (...,run_id)` + fallback se coluna falta (`:221` / `:529`).
+* `utils/error_handler.py:368` `guardar_erro(...,run_id)` + `:515` `tratar_erro(...,run_id)` — propagam `run_id` (ou `get_run_id()` se `None`) para `nif_api_erros` 15c.
+* `main.py:60` `ensure_run_id(cli_value=extract_cli_run_id())` por execução.
+
+**Persistência:** DDL `run_id TEXT` (SQLite) / `NVARCHAR(36)` (Azure) + `CREATE INDEX ...run_id` + migração idempotente (`PRAGMA table_info` + `ALTER TABLE ADD COLUMN` / `sql/03_migracao_run_id.sql` `COL_LENGTH` check) — ver §7.5.
+
+**Exemplo:**
+
+```powershell
+# determinístico
+python consulta_nif.py 509442013 --run-id 550e8400-e29b-41d4-a716-446655440000 | python importar_nif_sqlite.py
+# herança via JSON (sem --run-id no importador)
+python consulta_nif.py 509442013 --run-id 550e8400-e29b-41d4-a716-446655440000 | python importar_nif.py
+# agrupar por execução
+# sqlite3 data/nif_pt.db "SELECT run_id, COUNT(*) FROM nif_pt GROUP BY run_id;"
+# SELECT run_id, COUNT(*) FROM stg_nunotome.nif_api_erros GROUP BY run_id;
+```
+
+Ver `docs/technical.md` §10b e `docs/database/schema.md` §8.
+
+### 2.4b Camada de erros (v1.0.0 + run_id)
 
 `utils/error_handler.py` (612L):
 
@@ -146,12 +186,13 @@ Ver [docs/technical.md §10](docs/technical.md#10-camada-de-erros).
 
 | ADR | Decisão | Justificação |
 |-----|---------|--------------|
-| ADR-001 | SQLite JSON bruto vs Azure 36 cols | WAL schemaless vs analítico |
+| ADR-001 | SQLite JSON bruto vs Azure 37 cols (36+`run_id`) | WAL schemaless vs analítico (run_id indexado) |
 | ADR-002 | `WAL` | Mitiga `database is locked` |
 | ADR-003 | `ODBC 18` + `Encrypt=yes` | Exigido Azure |
-| ADR-007 | `error_handler` + `nif_api_erros` dual | Auditoria + retry `60s/3600s` vs abort |
+| ADR-007 | `error_handler` + `nif_api_erros` dual 15c `run_id` | Auditoria + retry `60s/3600s` vs abort + rastreabilidade por execução |
+| ADR-009 | `run_id` UUID v4 + `ContextVar` + `ensure_run_id` | `CLI>payload>ctx>gen`, `--run-id` replay, índices `run_id`, sem quebrar pipe |
 
-Ver [docs/technical.md §12](docs/technical.md#12-adrs) e [docs/architecture/architecture.md](docs/architecture/architecture.md).
+Ver [docs/technical.md §12](docs/technical.md#12-adrs) e [docs/architecture/architecture.md](docs/architecture/architecture.md) (9 ADRs).
 
 ---
 
@@ -179,7 +220,7 @@ Ver [docs/technical.md §12](docs/technical.md#12-adrs) e [docs/architecture/arc
 * `kiwa-pt-operations.database.windows.net` / `kiwa-pt-operations` / `stg_nunotome` (`config.yaml:33`).
 * Whitelist IP no Portal Azure → SQL → Networking.
 * Verificar driver: `Get-OdbcDriver` (PS) ou `odbcinst -q -d` (Linux).
-* Aplicar `sql/01_criar_tabelas.sql` (37c+40c) e `sql/02_criar_tabela_erros.sql` (14c) via SSMS/Azure Data Studio/`sqlcmd`.
+* Aplicar `sql/01_criar_tabelas.sql` (38c+41c) e `sql/02_criar_tabela_erros.sql` (15c) via SSMS/Azure Data Studio/`sqlcmd`; para BDs existentes aplicar `sql/03_migracao_run_id.sql` (idempotente `run_id`).
 
 ---
 
@@ -305,45 +346,56 @@ AZURE_PALAVRA_CHAVE=sua_password
 
 ```powershell
 python consulta_nif.py 509442013
+python consulta_nif.py 509442013 --run-id 550e8400-e29b-41d4-a716-446655440000  # replay determinístico
 ```
 
-* Valida `isdigit` + `validar_nif()` Mod-11 (`consulta_nif.py:48`) — log `WARN` se falha mas **não bloqueia** request.
-* Se `NIF-PT-KEY` falta → `{"erro":"NIF-PT-KEY não encontrada"}` + `exit 1` (`consulta_nif.py:88`).
-* Senão `GET http://www.nif.pt/?json=1&q=<NIF>&key=<KEY>` com `timeout 10s` e loop `max_global+1` com `tratar_erro()`.
+* Valida `isdigit` + `validar_nif()` Mod-11 (`consulta_nif.py:99`) — log `WARN` se falha mas **não bloqueia** request.
+* `run_id` gerado em `consulta_nif.py:481` `ensure_run_id(cli_value=extract_cli_run_id())` (`utils/run_id.py:132`); `run_id` incluído em **todos** os JSON (`consultar_nif(nif, run_id)` `consulta_nif.py:171` + `utils/run_id.py:87` precedência `CLI>payload>ctx>gen`), log `[run] run_id=...` e `BOX | run_id |`.
+* Se `NIF-PT-KEY` falta → `{"erro":"NIF-PT-KEY não encontrada","run_id":"..."} ` + `exit 1` (`consulta_nif.py:248`).
+* Senão `GET http://www.nif.pt/?json=1&q=<NIF>&key=<KEY>` com `timeout 10s` e loop `max_global+1` com `tratar_erro(...,run_id)` + `guardar_erro(...,run_id)`.
 
 ### 6.2 Modo 2 — SQLite local
 
 ```powershell
 python consulta_nif.py 509442013 | python importar_nif_sqlite.py
-# stderr: <<nif-pt>> INFO - [sqlite] INSERT nif_pt nif=509442013 -> 1 row em 0.02s
+python consulta_nif.py 509442013 --run-id 550e8400-e29b-41d4-a716-446655440000 | python importar_nif_sqlite.py --run-id 550e8400-e29b-41d4-a716-446655440000
+# stderr: <<nif-pt>> INFO - [sqlite] INSERT nif_pt nif=509442013 run_id=550e8400 -> 1 row em 0.02s
 #         | Guardado em SQLite |
+#         | run_id : 550e8400-e29b-41d4-a716-446655440000 |
 ```
 
-* `get_db()` cria `data/nif_pt.db` + `nif_pt` (`CREATE TABLE IF NOT EXISTS`, `PRAGMA WAL`) e `nif_api_erros` via `init_error_table()`.
-* `INSERT (nif, dados=JSON completo, data_consulta=datetime.now())`.
+* `get_db()` cria `data/nif_pt.db` + `nif_pt` (`CREATE TABLE IF NOT EXISTS` 5c `run_id TEXT`, `PRAGMA WAL`) + `idx_nif_pt_run_id` e `nif_api_erros` 15c via `init_error_table()`; migração idempotente `ALTER TABLE ADD COLUMN run_id TEXT`.
+* `INSERT (nif, dados=JSON completo, data_consulta=datetime.now(), run_id)` (`importar_nif_sqlite.py:221`) herdado do JSON via `ensure_run_id(CLI>payload>ctx>gen)` (`:185`) com fallback se coluna falta.
 
 ### 6.3 Modo 3 — Azure SQL
 
 ```powershell
 python consulta_nif.py 509442013 | python importar_nif.py
-# stderr: [db] INSERT stg_nunotome.nif_pt_stg nif=509442013 -> 1 row
+python consulta_nif.py 509442013 --run-id 550e8400-e29b-41d4-a716-446655440000 | python importar_nif.py
+# stderr: [db] INSERT stg_nunotome.nif_pt_stg nif=509442013 run_id=550e8400 -> 1 row
 #         | Inserido em Azure SQL |
+#         | run_id : 550e8400-e29b-41d4-a716-446655440000 |
 ```
 
-* Pré: ODBC 18, `AZURE_USER/PALAVRA_CHAVE`, tabelas criadas via `sql/01_criar_tabelas.sql` + `sql/02_criar_tabela_erros.sql`.
-* `mapear_registo()` 36 cols → `INSERT` parametrizado `?` com `commit/rollback`.
+* Pré: ODBC 18, `AZURE_USER/PALAVRA_CHAVE`, tabelas criadas via `sql/01_criar_tabelas.sql` (38c+41c `run_id`) + `sql/02_criar_tabela_erros.sql` (15c) + `sql/03_migracao_run_id.sql` se BD existente.
+* `mapear_registo(resultado, run_id)` 37 cols (36+`run_id` `importar_nif.py:223`) → `INSERT` parametrizado `?` ×37 com `commit/rollback` + fallback 36c se coluna falta (`:529`).
 
 ### 6.4 Modo 4 — Ambos em simultâneo
 
 **PowerShell (correção — `tee >( )` não existe):**
 
 ```powershell
-$json = python consulta_nif.py 509442013
-$json | python importar_nif_sqlite.py
-$json | python importar_nif.py
+$json = python consulta_nif.py 509442013          # inclui run_id
+$json | python importar_nif_sqlite.py             # herda run_id do JSON
+$json | python importar_nif.py                    # mesmo run_id — agrupável por run_id
+# ou determinístico:
+$rid = "550e8400-e29b-41d4-a716-446655440000"
+$json = python consulta_nif.py 509442013 --run-id $rid
+$json | python importar_nif_sqlite.py             # mesmo $rid
+$json | python importar_nif.py                    # mesmo $rid mesmo sem --run-id
 # ou:
 python consulta_nif.py 509442013 | Tee-Object -FilePath temp.json | python importar_nif.py
-python importar_nif_sqlite.py < temp.json
+python importar_nif_sqlite.py < temp.json         # herda run_id do JSON
 ```
 
 **Bash (WSL/Git Bash):**
@@ -403,24 +455,28 @@ Ver `docs/api/help.md` — transcrições verificadas.
 | Aspeto | SQLite `nif_pt` | SQLite `nif_api_erros` | Azure `nif_pt` | Azure `nif_pt_stg` | Azure `nif_api_erros` |
 |--------|-----------------|------------------------|----------------|--------------------|-----------------------|
 | Ficheiro | `data/nif_pt.db` | `data/nif_pt.db` | `kiwa-pt-operations` | idem | idem |
-| Cols | 4 | 14 | 37 | 40 | 14 |
+| Cols | 5 (4+`run_id`) | 15 (14+`run_id`) | 38 (37+`run_id`) | 41 (40+`run_id`) | 15 (14+`run_id`) |
 | PK | `id AUTOINCREMENT` | `id AUTOINCREMENT` | `nif` | `id IDENTITY` | `id IDENTITY` |
 | Histórico | Sim | Sim | Não (ouro) | Sim (`processado`) | Sim (`resolvido`) |
-| DDL | `importar_nif_sqlite.py:32` | `utils/error_handler.py:46` | `sql/01_criar_tabelas.sql:21` | `sql/01_criar_tabelas.sql:93` | `sql/02_criar_tabela_erros.sql:20` |
-| Estratégia | JSON bruto | Auditoria | 36 cols norm. | Staging + merge | Auditoria |
+| DDL | `importar_nif_sqlite.py:55` + `03` | `utils/error_handler.py:46` + `03` | `sql/01_criar_tabelas.sql:21` | `sql/01_criar_tabelas.sql:99` | `sql/02_criar_tabela_erros.sql:20` |
+| Estratégia | JSON bruto + `run_id` | Auditoria + `run_id` | 37c norm.+`run_id` | Staging + merge + `run_id` | Auditoria + `run_id` |
+| Índice `run_id` | `idx_nif_pt_run_id` | `idx_nif_api_erros_run_id` | `ix_nif_pt_run_id` | `ix_nif_pt_stg_run_id` | `ix_nif_api_erros_run_id` |
 
-### 7.2 SQLite — `nif_pt` (4 cols)
+### 7.2 SQLite — `nif_pt` (5c: 4+`run_id`)
 
 ```sql
 CREATE TABLE IF NOT EXISTS nif_pt (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     nif           INTEGER NOT NULL,
-    dados         TEXT NOT NULL,          -- json.dumps(resultado, ensure_ascii=False)
-    data_consulta TEXT NOT NULL DEFAULT (datetime('now'))
+    dados         TEXT NOT NULL,          -- json.dumps(resultado, ensure_ascii=False) inclui run_id
+    data_consulta TEXT NOT NULL DEFAULT (datetime('now')),
+    run_id        TEXT                    -- UUID v4 da execução (utils/run_id.py:41)
 );
+CREATE INDEX IF NOT EXISTS idx_nif_pt_run_id ON nif_pt(run_id);
+-- Migração idempotente (importar_nif_sqlite.py:102): PRAGMA table_info -> ALTER TABLE ADD COLUMN run_id TEXT
 ```
 
-### 7.3 SQLite/Azure — `nif_api_erros` (14 cols)
+### 7.3 SQLite/Azure — `nif_api_erros` (15c: 14+`run_id`)
 
 ```sql
 -- SQLite (utils/error_handler.py:46)
@@ -435,9 +491,11 @@ CREATE TABLE IF NOT EXISTS nif_api_erros (
     left_minute   INTEGER, left_paid INTEGER,
     dados_json    TEXT NOT NULL,          -- JSON completo
     acao          TEXT,                   -- retry_60s / abort_day / none
+    run_id        TEXT,                   -- UUID v4 da execução (utils/run_id.py:41)
     resolvido     INTEGER NOT NULL DEFAULT 0
 );
--- Índices: idx_nif_api_erros_nif, idx_nif_api_erros_tipo
+-- Índices: idx_nif_api_erros_nif, idx_nif_api_erros_tipo, idx_nif_api_erros_run_id
+-- Migração idempotente (utils/error_handler.py:153): PRAGMA table_info -> ALTER TABLE ADD COLUMN run_id TEXT
 ```
 
 ```sql
@@ -453,27 +511,35 @@ CREATE TABLE stg_nunotome.nif_api_erros (
     left_minute   INT NULL, left_paid INT NULL,
     dados_json    NVARCHAR(MAX) NOT NULL,
     acao          NVARCHAR(50) NULL,
+    run_id        NVARCHAR(36) NULL,       -- UUID v4 da execução
     resolvido     BIT NOT NULL DEFAULT 0,
     CONSTRAINT pk_nif_api_erros PRIMARY KEY CLUSTERED (id)
 );
--- Índices: ix_nif_api_erros_nif, _tipo, _data
+-- Índices: ix_nif_api_erros_nif, _tipo, _data, _run_id (sql/02:46 + sql/03:34)
 ```
 
-### 7.4 Azure SQL — `nif_pt` (37 cols, PK `nif`) e `nif_pt_stg` (40 cols, PK `id`)
+### 7.4 Azure SQL — `nif_pt` (38c: 37+`run_id`, PK `nif`) e `nif_pt_stg` (41c: 40+`run_id`, PK `id`)
 
-37 cols = `nif`, `nif_valido_formato`, `data_consulta`, `consulta_origem`, `seo_url`, `title`, `alias`, `status`, `start_date`, `activity`, `place_address/pc4/pc3/city`, `address/pc4/pc3/city`, `geo_region/county/parish`, `contacts_email/phone/website/fax`, `structure_nature/capital/capital_currency`, `cae`, `racius`, `portugalio`, `creditos_used`, `creditos_left_month/day/hour/minute/paid`.
+38 cols = `nif`, `nif_valido_formato`, `data_consulta`, `consulta_origem`, `seo_url`, `title`, `alias`, `status`, `start_date`, `activity`, `place_address/pc4/pc3/city`, `address/pc4/pc3/city`, `geo_region/county/parish`, `contacts_email/phone/website/fax`, `structure_nature/capital/capital_currency`, `cae`, `racius`, `portugalio`, `creditos_used`, `creditos_left_month/day/hour/minute/paid`, `run_id`.
 
-`nif_pt_stg` = 37 + `id`, `data_staging`, `processado` (40). `colunas_tabela()` (`importar_nif.py:169`) lista 36 (sem `id/data_*` com `DEFAULT`).
+`nif_pt_stg` = 38 + `id`, `data_staging`, `processado` (41). `colunas_tabela()` (`importar_nif.py:334`) lista 37 (inclui `run_id`, sem `id/data_*` com `DEFAULT`). Ver §7.5 migração.
 
 Ver `docs/database/schema.md` para catálogo completo + ER Mermaid.
 
-### 7.5 Criação das tabelas
+### 7.5 Criação e migração das tabelas
 
 ```powershell
-# SSMS / Azure Data Studio / sqlcmd
+# SSMS / Azure Data Studio / sqlcmd — novas BDs (01+02 já incluem run_id)
 sqlcmd -S kiwa-pt-operations.database.windows.net -d kiwa-pt-operations -i sql/01_criar_tabelas.sql
 sqlcmd -S kiwa-pt-operations.database.windows.net -d kiwa-pt-operations -i sql/02_criar_tabela_erros.sql
-# SQLite cria nif_api_erros automaticamente no próximo consulta_nif.py (init_error_table)
+
+# BDs existentes — migração idempotente run_id (não faz DROP, seguro em prod)
+sqlcmd -S kiwa-pt-operations.database.windows.net -d kiwa-pt-operations -i sql/03_migracao_run_id.sql
+# Verificação:
+# SELECT TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE COLUMN_NAME='run_id';
+
+# SQLite cria/migra nif_api_erros automaticamente no próximo consulta_nif.py (init_error_table + PRAGMA table_info)
+# + importar_nif_sqlite.py:get_db() migra nif_pt run_id automaticamente
 ```
 
 > `01_criar_tabelas.sql` faz `IF OBJECT_ID(...) IS NOT NULL DROP TABLE` — destrutivo. Em prod usar `IF NOT EXISTS CREATE`. Recomenda `CREATE INDEX ON nif_pt_stg(nif, processado) WHERE processado=0`.
@@ -484,33 +550,39 @@ sqlcmd -S kiwa-pt-operations.database.windows.net -d kiwa-pt-operations -i sql/0
 
 | Comando | Argumentos | stdin | stdout | stderr | Exit |
 |---------|------------|-------|--------|--------|------|
-| `consulta_nif.py` | `<NIF>` 9 dígitos | — | JSON | `<<nif-pt>>` BOX/TAG/TIMING | `0` ok, `1` erro |
-| `importar_nif_sqlite.py` | — | JSON | — | `BOX Guardado em SQLite` | `0/1` |
-| `importar_nif.py` | — | JSON | — | `BOX Inserido em Azure SQL` | `0/1` |
+| `consulta_nif.py` | `<NIF>` 9 dígitos `[--run-id UUID]` | — | JSON + `run_id` | `<<nif-pt>>` BOX/TAG/TIMING `[run]` | `0` ok, `1` erro |
+| `importar_nif_sqlite.py` | `[--run-id UUID]` | JSON + `run_id` | — | `BOX Guardado em SQLite run_id` | `0/1` |
+| `importar_nif.py` | `[--run-id UUID]` | JSON + `run_id` | — | `BOX Inserido em Azure SQL run_id` | `0/1` |
 
 ### 8.1 `consulta_nif.py`
 
 ```
-Uso: python consulta_nif.py <NIF>
+Uso: python consulta_nif.py <NIF> [--run-id <uuid>]
 Exemplo: python consulta_nif.py 509442013
+         python consulta_nif.py 509442013 --run-id 550e8400-e29b-41d4-a716-446655440000
+         python consulta_nif.py 509442013 --run-id=550e8400-e29b-41d4-a716-446655440000
 ```
 
-* `TIMEOUT 10s` + `max_tentativas_global 5` + `retry 60s/3600s` via `error_handler`.
-* `help(consulta_nif.validar_nif)` / `help(consulta_nif.consultar_nif)` para docstrings PEP 257.
+* `TIMEOUT 10s` + `max_tentativas_global 5` + `retry 60s/3600s` via `error_handler` com `run_id`.
+* `run_id` UUID v4 gerado por `utils/run_id.py:41` `generate_run_id()` + `ensure_run_id(CLI>payload>ctx>gen)` (`consulta_nif.py:481`); `remove_run_id_args` mantém `isdigit` posicional; `--run-id` suportado como `UUID` e `=UUID` (`utils/run_id.py:132`).
+* `help(consulta_nif.validar_nif)` / `help(consulta_nif.consultar_nif)` / `help(utils.run_id.generate_run_id)` para docstrings PEP 257.
 
 ### 8.2 Importadores
 
 ```
-Uso: python consulta_nif.py 509442013 | python importar_nif_sqlite.py
+Uso: python consulta_nif.py 509442013 | python importar_nif_sqlite.py [--run-id UUID]
      python importar_nif_sqlite.py < ficheiro.json
-     python consulta_nif.py 509442013 | python importar_nif.py
+     python importar_nif_sqlite.py --run-id 550e8400-e29b-41d4-a716-446655440000 < ficheiro.json
+     python consulta_nif.py 509442013 | python importar_nif.py [--run-id UUID]
 ```
+
+* Precedência `run_id`: `CLI --run-id` > `JSON payload run_id` > `ContextVar` > `uuid4` (`importar_nif.py:455` / `importar_nif_sqlite.py:185` `ensure_run_id`); herança automática via JSON é o recomendado (pipe sem `--run-id` no importador).
 
 ---
 
 ## 9. Referência de Dados e JSON
 
-### 9.1 Exemplo JSON sucesso (509442013, 2026-09-10)
+### 9.1 Exemplo JSON sucesso (509442013, 2026-09-10) — com `run_id`
 
 ```json
 {
@@ -537,11 +609,13 @@ Uso: python consulta_nif.py 509442013 | python importar_nif_sqlite.py
     "portugalio": null
   },
   "nif_valido_formato": true,
-  "creditos": { "used": "free", "left": [] }
+  "creditos": { "used": "free", "left": [] },
+  "run_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
+`run_id` gerado por `utils/run_id.py:41` (`generate_run_id()` UUID v4) em `consulta_nif.py:481` `ensure_run_id()` e propagado via `stdout` → `stdin` importadores (`importar_nif.py:455` / `importar_nif_sqlite.py:185`); todos os JSON (sucesso e erro) incluem `run_id`.
 
-### 9.2 Exemplo JSON erro rate-limit (classificado v1.0.0)
+### 9.2 Exemplo JSON erro rate-limit (classificado v1.0.0 + `run_id`)
 
 ```json
 {
@@ -554,13 +628,14 @@ Uso: python consulta_nif.py 509442013 | python importar_nif_sqlite.py
     "message": "Limit per minute exceeded",
     "credits": { "left": { "minute": 0, "hour": 9, "day": 99, "month": 999 } }
   },
-  "tipo_erro": "rate_limit_minute"
+  "tipo_erro": "rate_limit_minute",
+  "run_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
-Persistido em `nif_api_erros` com `acao=retry_60s` e retry automático 60s (max 3).
+Persistido em `nif_api_erros` 15c com `run_id` e `acao=retry_60s` (`utils/error_handler.py:368` `guardar_erro(...,run_id)`) e retry automático 60s (max 3); `SELECT * FROM nif_api_erros WHERE run_id='550e8400-...'` agrupa retries da mesma execução.
 
-### 9.3 Exemplo JSON `No records`
+### 9.3 Exemplo JSON `No records` (com `run_id`)
 
 ```json
 {
@@ -569,13 +644,14 @@ Persistido em `nif_api_erros` com `acao=retry_60s` e retry automático 60s (max 
   "fonte": "nif.pt",
   "erro": "No records found",
   "dados": { "result": "No records found", "nif_validation": false },
-  "tipo_erro": "generic_error"
+  "tipo_erro": "generic_error",
+  "run_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
-### 9.4 Mapeamento `mapear_registo()` → SQL
+### 9.4 Mapeamento `mapear_registo(resultado, run_id)` → SQL
 
-`importar_nif.py:103` desembrulha `dados.{place,geo,contacts,structure}` + `creditos`:
+`importar_nif.py:223` desembrulha `dados.{place,geo,contacts,structure}` + `creditos` + `run_id` (`utils/run_id.py:87`):
 
 | API | SQL | Parser |
 |-----|-----|--------|
@@ -584,8 +660,9 @@ Persistido em `nif_api_erros` com `acao=retry_60s` e retry automático 60s (max 
 | `dados.start_date` | `start_date` | `parse_date() -> date` |
 | `structure.capital` | `structure_capital` | `parse_capital() ","→"."` |
 | `creditos.left.month` | `creditos_left_month` | `parse_int()` |
+| `resultado.run_id` / `run_id` param | `run_id` | `ensure_run_id()` `CLI>payload>ctx` |
 
-`colunas_tabela()` 36 nomes — `parse_*` devolve `None` → `NULL`.
+`colunas_tabela()` 37 nomes (36+`run_id` `importar_nif.py:334`) — `parse_*` devolve `None` → `NULL`; `run_id` `NVARCHAR(36)` indexado.
 
 ### 9.5 Caso `creditos.left`
 
@@ -602,6 +679,14 @@ return digito == int(nif[8])
 ```
 
 `help(consulta_nif.validar_nif)` para docstring completa + exemplos.
+
+### 9.7 Campo `run_id` (v1.1.0)
+
+* **Tipo:** `str` UUID v4 `xxxxxxxx-xxxx-4xxx-xxxx-xxxxxxxxxxxx` (36c, 4 hífens) gerado por `utils/run_id.py:41` `generate_run_id()`.
+* **Presença:** sempre em `stdout` JSON (sucesso e erro, incluindo `NIF-PT-KEY` falta, timeout, `result != success`) — ver `consulta_nif.py:237` `run_id` em todos os `return`.
+* **Propagação:** `stdout` JSON `run_id` → `stdin` importadores via `ensure_run_id(CLI>payload>ctx>gen)` (`importar_nif_sqlite.py:185` / `importar_nif.py:455`); precedência `CLI --run-id` > `payload` > `ContextVar` > `uuid4`.
+* **Persistência:** `nif_pt.run_id` / `nif_pt_stg.run_id` / `nif_api_erros.run_id` (`NVARCHAR36`/`TEXT`) + índices `run_id`; SQLite migração automática, Azure `sql/03_migracao_run_id.sql`.
+* **Exemplo:** `python -c "from utils.run_id import generate_run_id; print(generate_run_id())"` → `550e8400-e29b-41d4-a716-446655440000`.
 
 ---
 
@@ -624,15 +709,15 @@ return digito == int(nif[8])
 | `No records found` / `error` | `generic_error` | `1` | sem registo público | `none` auditoria | 0 |
 | `Nenhum JSON no stdin` | — | `1` | pipe vazio | — | — |
 
-Importadores propagam `resultado.erro` — se `consulta_nif` falhou, não inserem. `tipo_erro` só em erros classificados.
+Importadores propagam `resultado.erro` — se `consulta_nif` falhou, não inserem. `tipo_erro` só em erros classificados. Todos os JSON (sucesso e erro) incluem `run_id` para `SELECT ... WHERE run_id=?`.
 
 ---
 
 ## 11. Logging
 
-### 11.1 Configuração v1.0.0
+### 11.1 Configuração v1.1.0 (run_id)
 
-`Logging/logging_orchestrator.py` (580L) — **integrado** em todos os scripts (`setup_logging()`):
+`Logging/logging_orchestrator.py` (580L) — **integrado** em todos os scripts (`setup_logging()`) com TAG `[run]`:
 
 * `LOG_LEVEL_GLOBAL/FILE/CONSOLE = INFO` · `FILE_ULTRA_DEBUG/CONSOLE_ULTRA_DEBUG = True`.
 * `LOG_FOLDER='log_files'`, `LOG_OUTPUT_FILE='log_files/nif_pt.log'`, prefixo `<<nif-pt>>`.
@@ -646,9 +731,9 @@ Importadores propagam `resultado.erro` — se `consulta_nif` falhou, não insere
 | 1 | `BANNER_APP_START/END` | `=` | 49 | INFO | `nif-pt consulta_nif a iniciar/finalizado` |
 | 3 | `BANNER_SECTION` | `-` | 49 | INFO | `Inserir staging` |
 | 5 | `BANNER_FUNCTION` | `~` | 49 | DEBUG | `validar_nif()` `consultar_nif()` `mapear_registo()` |
-| 6 | `TAG` | `[tag]` | — | herda | `[api][valid][cfg][db][sqlite][io][map][erro][rate-limit][cli]` |
+| 6 | `TAG` | `[tag]` | — | herda | `[api][valid][cfg][db][sqlite][io][map][erro][rate-limit][cli][run]` |
 | 7 | `SEPARATOR` | `-` | 49 | DEBUG | `---------------------------------------------------` |
-| 8 | `BOX` | `-\|` | 49 | INFO | `| NIF : 509442013 |` `| Consulta com sucesso |` |
+| 8 | `BOX` | `-\|` | 49 | INFO | `| NIF : 509442013 |` `| Consulta com sucesso |` `| run_id : 550e8400-... |` |
 | 9 | `TIMING` | `%.2fs` | — | INFO/DEBUG | `Aplicação concluída em 0.92s` `validar_nif -> 0.00s` |
 
 Regras: `R1 WIDTH=49 ≤79`, `R4 [tag] lowercase`, `R6 f"{' title ':=^49}"`, `R9 %.2fs` via `time.perf_counter()`.
@@ -659,17 +744,20 @@ Regras: `R1 WIDTH=49 ≤79`, `R4 [tag] lowercase`, `R6 f"{' title ':=^49}"`, `R9
 <<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ===================================================
 <<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ========= nif-pt consulta_nif a iniciar =========
 <<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ===================================================
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - [run] run_id=550e8400-e29b-41d4-a716-446655440000
 <<nif-pt>> 2026-09-10 02:15:32 - consulta_nif - INFO - [api] GET http://www.nif.pt?q=509442013 key=***XXXX timeout=10s
 <<nif-pt>> 2026-09-10 02:15:32 - consulta_nif - WARNING - [rate-limit] Limite por minuto nif=509442013 left_minute=0 — espera 60s retry tipo 1/3 global 1/5
-<<nif-pt>> 2026-09-10 02:15:32 - consulta_nif - INFO - [api] NIF 509442013 válido=True credits used=free left=[] (0.85s)
+<<nif-pt>> 2026-09-10 02:15:32 - consulta_nif - INFO - [api] NIF 509442013 válido=True credits used=free left=[] (0.85s) run_id=550e8400
 <<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ---------------------------------------------------
 <<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - | Consulta com sucesso                          |
 <<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - | NIF         : 509442013                    |
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - | run_id      : 550e8400-e29b-41d4-a716-...  |
 <<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - ---------------------------------------------------
+<<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - [run] run_id=550e8400-e29b-41d4-a716-446655440000
 <<nif-pt>> 2026-09-10 02:15:32 - __main__ - INFO - Aplicação concluída em 0.92s
 ```
 
-Ver `docs/guides/logging.md` + `docs/technical.md §11`.
+Ver `docs/guides/logging.md` + `docs/technical.md` §11 (logging) + §10b (run_id).
 
 ---
 
@@ -711,20 +799,24 @@ Get-Content nifs.txt | ForEach-Object {
 while read nif; do echo "A consultar $nif"; python consulta_nif.py "$nif" | python importar_nif_sqlite.py; sleep 1; done < nifs.txt
 ```
 
-### 12.5 Histórico SQLite
+### 12.5 Histórico SQLite (com `run_id`)
 
 ```powershell
-python -c "import sqlite3,json; conn=sqlite3.connect('data/nif_pt.db'); [print(f'{r[0]}: {r[1]} - {json.loads(r[2])[\"dados\"][\"title\"]}') for r in conn.execute('SELECT id,nif,dados FROM nif_pt ORDER BY data_consulta DESC LIMIT 5')]"
-sqlite3 data/nif_pt.db "SELECT id,nif,data_consulta FROM nif_pt;"
+python -c "import sqlite3,json; conn=sqlite3.connect('data/nif_pt.db'); [print(f'{r[0]}: {r[1]} - {json.loads(r[2])[\"dados\"][\"title\"]} run_id={r[3][:8]}') for r in conn.execute('SELECT id,nif,dados,run_id FROM nif_pt ORDER BY data_consulta DESC LIMIT 5')]"
+sqlite3 data/nif_pt.db "SELECT id,nif,substr(run_id,1,8),data_consulta FROM nif_pt ORDER BY data_consulta DESC LIMIT 5;"
 sqlite3 data/nif_pt.db "SELECT tipo_erro,COUNT(*) FROM nif_api_erros GROUP BY tipo_erro;"
+sqlite3 data/nif_pt.db "SELECT run_id, COUNT(*) FROM nif_pt GROUP BY run_id ORDER BY data_consulta DESC LIMIT 5;"
+sqlite3 data/nif_pt.db "SELECT run_id, tipo_erro, COUNT(*) FROM nif_api_erros GROUP BY run_id, tipo_erro;"
 ```
 
-### 12.6 Validar sem créditos
+### 12.6 Validar sem créditos + `run_id`
 
 ```powershell
 python -c "from consulta_nif import validar_nif; print(validar_nif('509442013'))"  # True
 python -c "from consulta_nif import validar_nif; print(validar_nif('123456789'))"  # False
 python -c "from utils.error_handler import classificar_erro; print(classificar_erro({'result':'error','message':'Limit per minute'}))"
+python -c "from utils.run_id import generate_run_id, ensure_run_id; print(generate_run_id()); print(ensure_run_id(payload_value='550e8400-e29b-41d4-a716-446655440000'))"
+python consulta_nif.py 509442013 --run-id 550e8400-e29b-41d4-a716-446655440000 | ConvertFrom-Json | Select-Object nif, run_id, tipo_erro
 ```
 
 ---
@@ -787,21 +879,23 @@ python -c "from consulta_nif import validar_nif; import sys; sys.exit(0 if valid
 
 **2. Créditos?** `creditos.left` dict se `paid`, `[]` se `free`; `importar_nif` → `NULL` se `[]`.
 
-**3. SQLite vs Azure?** SQLite JSON bruto (4 cols, WAL) flexível; Azure 36 cols + `nif_api_erros` 14 cols analítico.
+**3. SQLite vs Azure?** SQLite JSON bruto (5c 4+`run_id` WAL) flexível; Azure 37 cols + `run_id` + `nif_api_erros` 15c analítico.
 
-**4. Mod-11?** `Σ d*(9-i)%11 → 0 se resto 0/1 senão 11-resto` == `d[8]` (`consulta_nif.py:48`, `help(validar_nif)`).
+**4. Mod-11?** `Σ d*(9-i)%11 → 0 se resto 0/1 senão 11-resto` == `d[8]` (`consulta_nif.py:99`, `help(validar_nif)`).
 
-**5. Batch?** Sim, `sleep 1` + retry automático `60s/3600s` já trata `rate_limit`.
+**5. Batch?** Sim, `sleep 1` + retry automático `60s/3600s` já trata `rate_limit`; cada iteração tem `run_id` único — agrupar por `run_id`.
 
-**6. `nif_api_erros`?** Auditoria de todos os erros; `SELECT tipo_erro, mensagem, left_minute, acao FROM nif_api_erros`.
+**6. `nif_api_erros`?** Auditoria de todos os erros; `SELECT tipo_erro, mensagem, left_minute, acao, run_id FROM nif_api_erros` + `WHERE run_id='...'` por execução.
 
-**7. `main.py`?** Stub `BANNER+BOX`; futuro `cli.py --nif --to {sqlite,azure,both}`.
+**7. `main.py`?** `92L` `ensure_run_id()` por execução + stub `BANNER+BOX`; futuro `cli.py --nif --to {sqlite,azure,both}`.
 
 **8. `stg_nunotome`?** Schema pessoal (`config.yaml:33`); mudar para `stg/dbo` se partilhar.
 
-**9. Help Python?** `help(consulta_nif.validar_nif)`, `help(utils.error_handler.tratar_erro)` (ver `docs/api/help.md`).
+**9. Help Python?** `help(consulta_nif.validar_nif)`, `help(utils.error_handler.tratar_erro)`, `help(utils.run_id.generate_run_id)` (ver `docs/api/help.md`).
 
-**10. Histórico?** `SELECT * FROM nif_pt ORDER BY data_consulta DESC` (SQLite) ou `stg_nunotome.nif_pt_stg WHERE processado=0` (Azure).
+**10. Histórico?** `SELECT * FROM nif_pt ORDER BY data_consulta DESC` (SQLite) ou `stg_nunotome.nif_pt_stg WHERE processado=0` (Azure); filtrar por `WHERE run_id='...'` para uma execução.
+
+**11. `run_id`?** UUID v4 por execução (`utils/run_id.py:41`); `python consulta_nif.py 509442013 --run-id <uuid>` determinístico; propagação `CLI>payload>ctx>gen` via JSON `run_id`; ver `docs/technical.md` §10b.
 
 ---
 
@@ -809,41 +903,44 @@ python -c "from consulta_nif import validar_nif; import sys; sys.exit(0 if valid
 
 ### 15.1 Glossário
 
-Ver [docs/glossary.md](docs/glossary.md). Termos: NIF, Mod-11, CAE, WAL, ODBC, `stg`, `creditos.left`, `nif_valido_formato`, `get_config`, `RotatingFileHandler`, `BOX/TAG/TIMING`, `rate_limit_*`, ADR, C4.
+Ver [docs/glossary.md](docs/glossary.md). Termos: NIF, Mod-11, CAE, WAL, ODBC, `stg`, `creditos.left`, `nif_valido_formato`, `get_config`, `RotatingFileHandler`, `BOX/TAG/TIMING`, `rate_limit_*`, ADR, C4, `run_id`, `ContextVar`, `ensure_run_id`.
 
-### 15.2 Estrutura de ficheiros (v1.0.0)
+### 15.2 Estrutura de ficheiros (v1.1.0 run_id)
 
 ```
 nif-pt/
-├── consulta_nif.py               # 355L — validar + GET + retry per-tipo+global
-├── importar_nif.py               # 321L — 36 cols → Azure staging
-├── importar_nif_sqlite.py        # 152L — JSON → SQLite WAL
-├── utils/error_handler.py        # 612L — classificar + tratar + guardar + init
-├── Logging/logging_orchestrator.py # 580L — R1-R9, <<nif-pt>>, 10MB/5000/10
-├── main.py                       # 52L — stub
+├── consulta_nif.py               # 570L — validar + GET + retry per-tipo+global + run_id + --run-id
+├── importar_nif.py               # 576L — 37 cols (36+run_id) → Azure staging + --run-id
+├── importar_nif_sqlite.py        # 268L — JSON → SQLite WAL 5c + run_id + --run-id + migração
+├── utils/run_id.py               # 191L — generate_run_id UUID v4 + ContextVar + ensure_run_id + --run-id parse
+├── utils/error_handler.py        # 806L — classificar + tratar(...,run_id) + guardar(...,run_id) + init 15c run_id
+├── main.py                       # 92L — ensure_run_id por execução + stub
+├── Logging/logging_orchestrator.py # 580L — R1-R9, <<nif-pt>>, 10MB/5000/10, TAG [run]
 ├── config/config.py              # 70L — get_config() + ***
 ├── config/config.yaml            # 37L — default 11 chaves + 3 blocos
-├── sql/01_criar_tabelas.sql      # 157L — nif_pt 37c + nif_pt_stg 40c
-├── sql/02_criar_tabela_erros.sql # 44L — nif_api_erros 14c
-├── docs/technical.md             # v1.0.0 — C4 + sequência + ER + ADRs
-├── docs/api/help.md              # help() verificado
-├── docs/architecture/            # C4 + diagramas Mermaid v1.0.0
-├── docs/database/schema.md       # ER 37/40/14 cols
+├── sql/01_criar_tabelas.sql      # 169L — nif_pt 38c (37+run_id) + nif_pt_stg 41c (40+run_id) + idx run_id
+├── sql/02_criar_tabela_erros.sql # 47L — nif_api_erros 15c (14+run_id) + idx run_id
+├── sql/03_migracao_run_id.sql    # 39L — migração idempotente run_id (ALTER + INDEX) para BDs existentes
+├── docs/technical.md             # v1.1.0 — C4 + sequência run_id + ER 38/41/15c + catálogo + ADRs (ADR-009)
+├── docs/api/help.md              # help() verificado (validar_nif, consultar_nif, generate_run_id)
+├── docs/architecture/            # C4 + diagramas Mermaid v1.1.0 + ADR-009 run_id
+├── docs/database/schema.md       # ER 38/41/15c + run_id + 03_migracao_run_id.sql
 ├── docs/api/nif-pt-api.md        # contrato nif.pt
-├── data/nif_pt.db                # WAL, ignorado
-├── log_files/nif_pt.log          # RotatingFileHandler, ignorado
+├── data/nif_pt.db                # WAL, ignorado (auto-migra run_id)
+├── log_files/nif_pt.log          # RotatingFileHandler, ignorado (BOX run_id)
 ├── requirements.txt              # requests, pyyaml, dotenv, pyodbc
-├── README.md                     # porta de entrada v1.0.0
-├── CHANGELOG.md                  # v1.0.0
+├── README.md                     # porta de entrada v1.1.0
+├── CHANGELOG.md                  # v1.1.0
 └── MANUAL.md                     # este ficheiro
 ```
 
 ### 15.3 Changelog resumido
 
-Ver [CHANGELOG.md](CHANGELOG.md) — `v1.0.0` promove `beta` com `error_handler` + `logging_orchestrator` + `max_tentativas_*`.
+Ver [CHANGELOG.md](CHANGELOG.md) — `v1.1.0` adiciona `run_id` (rastreabilidade por execução); `v1.0.0` promove `beta` com `error_handler` + `logging_orchestrator` + `max_tentativas_*`.
 
 ### 15.4 Referências
 
-* `nif.pt` API: `GET http://www.nif.pt/?json=1&q=<NIF>&key=<KEY>` (`consulta_nif.py:98`)
-* `config/config.py:30` `get_config()` · `utils/error_handler.py:346` `tratar_erro()` · `Logging/logging_orchestrator.py:226` `setup_logging()`
-* [docs/technical.md](docs/technical.md) · [docs/architecture/diagrams.md](docs/architecture/diagrams.md) · [docs/api/help.md](docs/api/help.md)
+* `nif.pt` API: `GET http://www.nif.pt/?json=1&q=<NIF>&key=<KEY>` (`consulta_nif.py:272`)
+* `config/config.py:30` `get_config()` · `utils/error_handler.py:515` `tratar_erro(...,run_id)` · `utils/run_id.py:41` `generate_run_id` / `:87` `ensure_run_id` · `Logging/logging_orchestrator.py:226` `setup_logging()` + TAG `[run]`
+* `sql/03_migracao_run_id.sql` migração idempotente · `importar_nif.py:334` `colunas_tabela()` 37c
+* [docs/technical.md](docs/technical.md) §10b run_id · [docs/architecture/diagrams.md](docs/architecture/diagrams.md) · [docs/api/help.md](docs/api/help.md) · [docs/database/schema.md](docs/database/schema.md) 38/41/15c

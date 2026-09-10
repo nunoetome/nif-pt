@@ -76,9 +76,15 @@ CREATE TABLE stg_nunotome.nif_pt (
     creditos_left_minute    INT             NULL,
     creditos_left_paid      INT             NULL,
 
+    -- Rastreabilidade por execução
+    run_id                  NVARCHAR(36)    NULL,
+
     -- Constraints
     CONSTRAINT pk_nif_pt PRIMARY KEY CLUSTERED (nif)
 );
+GO
+
+CREATE INDEX ix_nif_pt_run_id ON stg_nunotome.nif_pt(run_id);
 GO
 
 -- =============================================================================
@@ -151,7 +157,13 @@ CREATE TABLE stg_nunotome.nif_pt_stg (
     creditos_left_minute    INT             NULL,
     creditos_left_paid      INT             NULL,
 
+    -- Rastreabilidade por execução
+    run_id                  NVARCHAR(36)    NULL,
+
     -- Constraints
     CONSTRAINT pk_nif_pt_stg PRIMARY KEY CLUSTERED (id)
 );
+GO
+
+CREATE INDEX ix_nif_pt_stg_run_id ON stg_nunotome.nif_pt_stg(run_id);
 GO

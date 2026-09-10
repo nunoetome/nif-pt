@@ -31,6 +31,7 @@ CREATE TABLE stg_nunotome.nif_api_erros (
     left_paid               INT             NULL,
     dados_json              NVARCHAR(MAX)   NOT NULL,   -- JSON completo da API
     acao                    NVARCHAR(50)    NULL,       -- retry_60s / retry_3600s / abort_day / abort_month / none
+    run_id                  NVARCHAR(36)    NULL,       -- identificador da execução (UUID v4)
     resolvido               BIT             NOT NULL DEFAULT 0,
     CONSTRAINT pk_nif_api_erros PRIMARY KEY CLUSTERED (id)
 );
@@ -41,4 +42,6 @@ GO
 CREATE INDEX ix_nif_api_erros_tipo ON stg_nunotome.nif_api_erros(tipo_erro);
 GO
 CREATE INDEX ix_nif_api_erros_data ON stg_nunotome.nif_api_erros(data_erro);
+GO
+CREATE INDEX ix_nif_api_erros_run_id ON stg_nunotome.nif_api_erros(run_id);
 GO

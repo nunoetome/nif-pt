@@ -43,6 +43,7 @@ from datetime import date, datetime
 
 from config.config import get_config
 from Logging.logging_orchestrator import setup_logging
+from utils.run_id import ensure_run_id, extract_cli_run_id, get_run_id, set_run_id
 import pyodbc
 
 logger = logging.getLogger(__name__)
@@ -219,21 +220,23 @@ def parse_int(val) -> int | None:
         return None
 
 
-def mapear_registo(resultado: dict) -> dict:
-    """Mapeia o JSON normalizado de :func:`consulta_nif.consultar_nif` para 36 colunas SQL.
+def mapear_registo(resultado: dict, run_id: str | None = None) -> dict:
+    """Mapeia o JSON normalizado de :func:`consulta_nif.consultar_nif` para 37 colunas SQL.
 
     Desembrulha ``resultado["dados"]`` (``place``, ``geo``, ``contacts``,
     ``structure``, ``cae``) + ``resultado["creditos"]`` e aplica
     :func:`parse_date` / :func:`parse_capital` / :func:`parse_int` /
     :func:`extrair_cae`. Trata o caso ``credits.left == []`` (free plan →
-    ``{}``).
+    ``{}``). Inclui ``run_id`` para rastreabilidade por execução.
 
     Args:
         resultado: Dict devolvido por :func:`consulta_nif.consultar_nif`
             (``nif``, ``fonte``, ``dados``, ``creditos``, ``nif_valido_formato``).
+        run_id: Identificador da execução. Se ``None`` tenta
+            ``resultado["run_id"]`` ou ``utils.run_id.get_run_id()``.
 
     Returns:
-        Dict com 36 chaves — ordem de :func:`colunas_tabela`:
+        Dict com 37 chaves — ordem de :func:`colunas_tabela`:
 
         * ``nif`` (int), ``nif_valido_formato`` (0/1), ``consulta_origem``,
         * ``seo_url``, ``title``, ``alias``, ``status``, ``start_date`` (date|None),
@@ -243,7 +246,8 @@ def mapear_registo(resultado: dict) -> dict:
         * ``contacts_email/phone/website/fax``,
         * ``structure_nature/capital/capital_currency``,
         * ``cae`` (CSV), ``racius``, ``portugalio``,
-        * ``creditos_used``, ``creditos_left_month/day/hour/minute/paid`` (int|None).
+        * ``creditos_used``, ``creditos_left_month/day/hour/minute/paid`` (int|None),
+        * ``run_id`` (str|None) — identificador da execução.
 
     Examples:
         >>> r = {"nif": "509442013", "fonte": "nif.pt", "nif_valido_formato": True,
@@ -271,6 +275,8 @@ def mapear_registo(resultado: dict) -> dict:
         # free plan devolve [] em vez de dict
         logger.debug("[map] creditos.left é lista vazia (free plan) -> dict vazio")
         creditos_left = {}
+    # run_id — CLI > payload > contexto
+    _run_id = run_id or resultado.get("run_id") or get_run_id()
 
     mapped = {
         "nif": parse_int(resultado.get("nif")),
@@ -309,33 +315,35 @@ def mapear_registo(resultado: dict) -> dict:
         "creditos_left_hour": parse_int(creditos_left.get("hour")),
         "creditos_left_minute": parse_int(creditos_left.get("minute")),
         "creditos_left_paid": parse_int(creditos_left.get("paid")),
+        "run_id": _run_id,
     }
 
     logger.info(
-        "[map] 36 cols mapeadas nif=%s title=%.30s cae=%s credits used=%s left_month=%s",
+        "[map] 37 cols mapeadas nif=%s title=%.30s cae=%s credits used=%s left_month=%s run_id=%s",
         mapped.get("nif"),
         (mapped.get("title") or "")[:30],
         (mapped.get("cae") or "")[:50],
         mapped.get("creditos_used"),
         mapped.get("creditos_left_month"),
+        (_run_id[:8] + "...") if _run_id else "—",
     )
     logger.debug("[map] mapear_registo() -> %.2fs", time.perf_counter() - t)
     return mapped
 
 
 def colunas_tabela() -> list[str]:
-    """Devolve a lista ordenada das 36 colunas para ``INSERT`` em ``nif_pt_stg``.
+    """Devolve a lista ordenada das 37 colunas para ``INSERT`` em ``nif_pt_stg``.
 
     Exclui colunas com ``DEFAULT`` (``id``, ``data_consulta``,
     ``data_staging``, ``processado``) — o ``INSERT`` omite-as intencionalmente.
 
     Returns:
-        Lista de 36 nomes — 1 ``nif`` + 35 restantes na ordem do DDL
-        ``sql/01_criar_tabelas.sql``.
+        Lista de 37 nomes — 1 ``nif`` + 36 restantes na ordem do DDL
+        ``sql/01_criar_tabelas.sql`` (inclui ``run_id``).
 
     Examples:
         >>> len(colunas_tabela())
-        36
+        37
         >>> colunas_tabela()[:3]
         ['nif', 'nif_valido_formato', 'consulta_origem']
     """
@@ -350,6 +358,7 @@ def colunas_tabela() -> list[str]:
         "cae", "racius", "portugalio",
         "creditos_used", "creditos_left_month", "creditos_left_day",
         "creditos_left_hour", "creditos_left_minute", "creditos_left_paid",
+        "run_id",
     ]
 
 
@@ -390,22 +399,23 @@ def main():
 
     Fluxo:
 
-    1. ``setup_logging()`` + BANNER ``= 49``.
+    1. ``setup_logging()`` + BANNER ``= 49`` + ``run_id``.
     2. ``sys.stdin.read()`` — ``exit 1`` se vazio.
     3. ``json.loads`` — ``exit 1`` se inválido.
     4. Se ``resultado["erro"]`` → log + ``exit 1`` (não insere).
-    5. ``mapear_registo(resultado)`` → 36 cols.
+    5. ``mapear_registo(resultado)`` → 37 cols (inclui ``run_id``).
     6. Valida ``AZURE_USER`` / ``AZURE_PALAVRA_CHAVE`` — ``exit 1`` se falta.
     7. ``pyodbc.connect(connection_string(), timeout=30)`` com ``autocommit=False``.
-    8. ``INSERT INTO {TABELA_STAGING} (36 cols) VALUES (36 ?)`` + ``commit``
+    8. ``INSERT INTO {TABELA_STAGING} (37 cols) VALUES (37 ?)`` + ``commit``
        (``rollback`` em ``pyodbc.Error``) + BOX ``Inserido em Azure SQL``.
+       Fallback sem ``run_id`` se coluna falta (BD antiga).
 
     Args:
-        Nenhum — lê ``sys.stdin`` integralmente.
+        Nenhum — lê ``sys.stdin`` integralmente. Aceita ``--run-id <uuid>``.
 
     Returns:
         Não retorna — ``sys.exit(0)`` em sucesso, ``sys.exit(1)`` em erro.
-        ``stderr`` com TAGs ``[io][map][db]``; ``stdout`` vazio.
+        ``stderr`` com TAGs ``[io][map][db][run]``; ``stdout`` vazio.
 
     See Also:
         :func:`mapear_registo`, :func:`connection_string`, :func:`colunas_tabela`
@@ -415,6 +425,11 @@ def main():
     logger_main.info(f"{' nif-pt importar_nif a iniciar ':=^49}")
     logger_main.info("=" * 49)
     t_app = time.perf_counter()
+
+    cli_run_id = extract_cli_run_id()
+    if cli_run_id:
+        set_run_id(cli_run_id)
+        logger_main.info("[run] run_id (cli)=%s", cli_run_id)
 
     raw = sys.stdin.read()
     logger_main.debug("[io] stdin lido %d bytes", len(raw))
@@ -428,7 +443,7 @@ def main():
 
     try:
         resultado = json.loads(raw)
-        logger_main.debug("[io] JSON carregado nif=%s", resultado.get("nif"))
+        logger_main.debug("[io] JSON carregado nif=%s run_id=%s", resultado.get("nif"), resultado.get("run_id"))
     except json.JSONDecodeError as e:
         logger_main.error("[io] JSON inválido: %s (preview=%.80s)", e, raw[:80])
         logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
@@ -437,12 +452,20 @@ def main():
         logger_main.info("=" * 49)
         sys.exit(1)
 
+    _run_id = ensure_run_id(cli_value=cli_run_id, payload_value=resultado.get("run_id"))
+    if not resultado.get("run_id"):
+        logger_main.warning("[run] run_id ausente no JSON — gerado novo %s", _run_id[:8])
+        resultado["run_id"] = _run_id
+    else:
+        logger_main.info("[run] run_id=%s (herdado do JSON)", _run_id)
+
     if resultado.get("erro"):
-        logger_main.warning("[api] Erro consulta propagado: %s", resultado["erro"])
+        logger_main.warning("[api] Erro consulta propagado: %s run_id=%s", resultado["erro"], _run_id[:8])
         # mostrar também message detalhada se existir em dados
         dados = resultado.get("dados") or {}
         if isinstance(dados, dict) and dados.get("message"):
             logger_main.warning("[api] Detalhe: %s", dados.get("message"))
+        logger_main.info("[run] run_id=%s", _run_id)
         logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
         logger_main.info("=" * 49)
         logger_main.info(f"{' nif-pt importar_nif finalizado ':=^49}")
@@ -459,7 +482,7 @@ def main():
         sys.exit(1)
 
     logger_main.debug("-" * 49)
-    reg = mapear_registo(resultado)
+    reg = mapear_registo(resultado, run_id=_run_id)
 
     if not AZURE_USER or not AZURE_PALAVRA_CHAVE:
         logger_main.error("[cfg] AZURE_USER ou AZURE_PALAVRA_CHAVE não definidos no config/.env")
@@ -499,8 +522,19 @@ def main():
 
     try:
         t_insert = time.perf_counter()
-        cursor.execute(sql_insert_stg, vals)
-        logger_main.info("[db] INSERT %s nif=%s -> 1 row em %.2fs", TABELA_STAGING, nif, time.perf_counter() - t_insert)
+        try:
+            cursor.execute(sql_insert_stg, vals)
+        except pyodbc.Error as ie:
+            # fallback se coluna run_id falta na BD antiga
+            if "run_id" in str(ie).lower():
+                logger_main.warning("[db] Coluna run_id em falta — fallback sem run_id: %s", ie)
+                cols_fb = [c for c in cols if c != "run_id"]
+                vals_fb = [reg.get(c) for c in cols_fb]
+                sql_fb = f"INSERT INTO {TABELA_STAGING} ({','.join(cols_fb)}) VALUES ({','.join('?' for _ in cols_fb)})"
+                cursor.execute(sql_fb, vals_fb)
+            else:
+                raise
+        logger_main.info("[db] INSERT %s nif=%s run_id=%s -> 1 row em %.2fs", TABELA_STAGING, nif, _run_id[:8], time.perf_counter() - t_insert)
         conn.commit()
         logger_main.debug("[db] commit OK")
         # BOX sucesso
@@ -511,11 +545,12 @@ def main():
         logger_main.info("| Tabela      : %-30s |", TABELA_STAGING[:30])
         logger_main.info("| Titulo      : %-30s |", (reg.get("title") or "")[:30])
         logger_main.info("| CAE         : %-30s |", (reg.get("cae") or "")[:30])
+        logger_main.info("| run_id      : %-30s |", _run_id[:30])
         logger_main.info("| Tempo       : %-30s |", f"{time.perf_counter() - t_app:.2f}s")
         logger_main.info("-" * 49)
     except pyodbc.Error as e:
         conn.rollback()
-        logger_main.error("[db] Falha inserção nif=%s: %s", nif, e)
+        logger_main.error("[db] Falha inserção nif=%s run_id=%s: %s", nif, _run_id[:8], e)
         logger_main.warning("[db] rollback executado")
         logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
         logger_main.info("=" * 49)
@@ -530,6 +565,7 @@ def main():
         except Exception:
             pass
 
+    logger_main.info("[run] run_id=%s", _run_id)
     logger_main.info("Importar concluído em %.2fs", time.perf_counter() - t_app)
     logger_main.info("=" * 49)
     logger_main.info(f"{' nif-pt importar_nif finalizado ':=^49}")

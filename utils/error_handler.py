@@ -58,12 +58,14 @@ CREATE TABLE IF NOT EXISTS nif_api_erros (
     left_paid       INTEGER,
     dados_json      TEXT NOT NULL,
     acao            TEXT,
+    run_id          TEXT,
     resolvido       INTEGER NOT NULL DEFAULT 0
 );
 """
 
 DDL_ERROS_INDEX = "CREATE INDEX IF NOT EXISTS idx_nif_api_erros_nif ON nif_api_erros(nif);"
 DDL_ERROS_INDEX_TIPO = "CREATE INDEX IF NOT EXISTS idx_nif_api_erros_tipo ON nif_api_erros(tipo_erro);"
+DDL_ERROS_INDEX_RUNID = "CREATE INDEX IF NOT EXISTS idx_nif_api_erros_run_id ON nif_api_erros(run_id);"
 
 # --- Tipos de erro (constantes) ----------------------------------------------
 TIPO_RATE_LIMIT_MINUTE = "rate_limit_minute"
@@ -144,6 +146,20 @@ def _get_connection() -> sqlite3.Connection:
         conn.executescript(DDL_ERROS)
         conn.execute(DDL_ERROS_INDEX)
         conn.execute(DDL_ERROS_INDEX_TIPO)
+        try:
+            conn.execute(DDL_ERROS_INDEX_RUNID)
+        except sqlite3.Error:
+            pass
+        # migração idempotente para BDs antigas sem run_id
+        try:
+            cur = conn.execute("PRAGMA table_info(nif_api_erros)")
+            cols = [r[1] for r in cur.fetchall()]
+            if "run_id" not in cols:
+                conn.execute("ALTER TABLE nif_api_erros ADD COLUMN run_id TEXT")
+                conn.commit()
+                logger.info("[erro] Migração: coluna run_id adicionada a nif_api_erros")
+        except sqlite3.Error as me:
+            logger.debug("[erro] Migração run_id ignorada: %s", me)
         conn.commit()
         logger.debug("[erro] DDL nif_api_erros garantido")
     except sqlite3.Error as e:
@@ -357,13 +373,14 @@ def guardar_erro(
     left: dict | None,
     dados_completos: dict,
     acao: str | None = None,
+    run_id: str | None = None,
 ) -> int | None:
     """Guarda o erro na tabela ``nif_api_erros`` (SQLite, WAL).
 
     Persiste ``nif``, ``tipo_erro``, ``codigo_erro`` (``result`` da API),
     ``mensagem`` (``message``), ``left_*`` (``credits.left``), ``dados_json``
-    (payload completo), ``acao`` (``retry_60s`` / ``abort_day`` / ``none``)
-    e ``resolvido=0``.
+    (payload completo), ``acao`` (``retry_60s`` / ``abort_day`` / ``none``),
+    ``run_id`` (identificador da execução) e ``resolvido=0``.
 
     Args:
         nif: NIF consultado (str ou int; ``None`` → ``NULL``).
@@ -373,6 +390,8 @@ def guardar_erro(
         left: ``data["credits"]["left"]`` (dict ou ``None``/``[]``).
         dados_completos: Payload completo da API (serializado para JSON).
         acao: ``"retry_60s"`` / ``"retry_3600s"`` / ``"abort_day"`` / ``"none"``.
+        run_id: Identificador da execução (``utils.run_id``). Se ``None``
+            tenta resolver via ``get_run_id()``.
 
     Returns:
         ``id`` (``lastrowid``) do registo inserido ou ``None`` se falhar
@@ -401,39 +420,78 @@ def guardar_erro(
     except Exception:
         nif_int = None
 
+    # run_id — tenta contexto se não fornecido
+    if run_id is None:
+        try:
+            from utils.run_id import get_run_id
+            run_id = get_run_id()
+        except Exception:
+            run_id = None
+
     conn = _get_connection()
     try:
         cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO nif_api_erros
-                (nif, tipo_erro, codigo_erro, mensagem,
-                 left_month, left_day, left_hour, left_minute, left_paid,
-                 dados_json, acao)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                nif_int,
-                tipo_erro,
-                codigo_erro,
-                mensagem,
-                _safe_int(left.get("month")),
-                _safe_int(left.get("day")),
-                _safe_int(left.get("hour")),
-                _safe_int(left.get("minute")),
-                _safe_int(left.get("paid")),
-                dados_json,
-                acao,
-            ),
-        )
+        # Tenta com run_id; fallback sem coluna para BDs antigas
+        try:
+            cur.execute(
+                """
+                INSERT INTO nif_api_erros
+                    (nif, tipo_erro, codigo_erro, mensagem,
+                     left_month, left_day, left_hour, left_minute, left_paid,
+                     dados_json, acao, run_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    nif_int,
+                    tipo_erro,
+                    codigo_erro,
+                    mensagem,
+                    _safe_int(left.get("month")),
+                    _safe_int(left.get("day")),
+                    _safe_int(left.get("hour")),
+                    _safe_int(left.get("minute")),
+                    _safe_int(left.get("paid")),
+                    dados_json,
+                    acao,
+                    run_id,
+                ),
+            )
+        except sqlite3.OperationalError as oe:
+            if "run_id" in str(oe).lower() or "no column named run_id" in str(oe).lower():
+                logger.debug("[erro] Fallback sem run_id (coluna em falta): %s", oe)
+                cur.execute(
+                    """
+                    INSERT INTO nif_api_erros
+                        (nif, tipo_erro, codigo_erro, mensagem,
+                         left_month, left_day, left_hour, left_minute, left_paid,
+                         dados_json, acao)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        nif_int,
+                        tipo_erro,
+                        codigo_erro,
+                        mensagem,
+                        _safe_int(left.get("month")),
+                        _safe_int(left.get("day")),
+                        _safe_int(left.get("hour")),
+                        _safe_int(left.get("minute")),
+                        _safe_int(left.get("paid")),
+                        dados_json,
+                        acao,
+                    ),
+                )
+            else:
+                raise
         conn.commit()
         row_id = cur.lastrowid
         logger.info(
-            "[erro] Erro guardado id=%s nif=%s tipo=%s acao=%s em %.2fs",
+            "[erro] Erro guardado id=%s nif=%s tipo=%s acao=%s run_id=%s em %.2fs",
             row_id,
             nif,
             tipo_erro,
             acao,
+            (run_id[:8] + "...") if run_id else "—",
             time.perf_counter() - t,
         )
         return row_id
@@ -461,6 +519,7 @@ def tratar_erro(
     retry_count: int = 1,
     tentativas_por_tipo: dict | None = None,
     tentativa_global: int | None = None,
+    run_id: str | None = None,
 ) -> dict:
     """
     Ponto de entrada principal da camada de tratamento de erros.
@@ -509,7 +568,15 @@ def tratar_erro(
     if isinstance(left, list):
         left = {}
 
-    logger.info("[erro] Tipo classificado nif=%s tipo=%s codigo='%s' msg='%.120s'", nif, tipo, codigo, mensagem)
+    # run_id resolve (contexto se não passado)
+    if run_id is None:
+        try:
+            from utils.run_id import get_run_id
+            run_id = get_run_id()
+        except Exception:
+            run_id = None
+
+    logger.info("[erro] Tipo classificado nif=%s tipo=%s codigo='%s' msg='%.120s' run_id=%s", nif, tipo, codigo, mensagem, (run_id[:8] + "...") if run_id else "—")
 
     # Helpers — limites por tipo + global (novo) vs legado
     modo_novo = tentativas_por_tipo is not None or tentativa_global is not None
@@ -560,7 +627,7 @@ def tratar_erro(
             tenta_tipo = attempt
             tenta_global = attempt
         acao = "retry" if deve_retry else "abort_retry_esgotado"
-        guardar_erro(nif, tipo, codigo, mensagem, left, data, acao=f"retry_{espera}s" if deve_retry else "abort_retry_esgotado")
+        guardar_erro(nif, tipo, codigo, mensagem, left, data, acao=f"retry_{espera}s" if deve_retry else "abort_retry_esgotado", run_id=run_id)
         if deve_retry:
             logger.warning(
                 "[rate-limit] Limite por minuto nif=%s left_minute=%s — espera %ss retry tipo %d/%d global %d/%d (%s)",
@@ -618,7 +685,7 @@ def tratar_erro(
             tenta_tipo = attempt
             tenta_global = attempt
         acao = "retry" if deve_retry else "abort_retry_esgotado"
-        guardar_erro(nif, tipo, codigo, mensagem, left, data, acao=f"retry_{espera}s" if deve_retry else "abort_retry_esgotado")
+        guardar_erro(nif, tipo, codigo, mensagem, left, data, acao=f"retry_{espera}s" if deve_retry else "abort_retry_esgotado", run_id=run_id)
         if deve_retry:
             logger.warning(
                 "[rate-limit] Limite por hora nif=%s left_hour=%s — espera %ss (%dh) retry tipo %d/%d global %d/%d (%s)",
@@ -654,7 +721,7 @@ def tratar_erro(
         tenta_tipo = (tentativas_por_tipo or {}).get(tipo, 0) if modo_novo else attempt
         tenta_global = tentativa_global if tentativa_global is not None else attempt
         # dia/mês são fatais; mesmo que max_tipo >0, aborta (config 0 por defeito)
-        guardar_erro(nif, tipo, codigo, mensagem, left, data, acao="abort_day")
+        guardar_erro(nif, tipo, codigo, mensagem, left, data, acao="abort_day", run_id=run_id)
         logger.error(
             "[rate-limit] Limite por dia atingido nif=%s left_day=%s tipo %d/%d global %d/%d — a encerrar app",
             nif, left.get("day") if isinstance(left, dict) else "?", tenta_tipo, max_tipo, tenta_global, max_global,
@@ -673,7 +740,7 @@ def tratar_erro(
         max_global = get_max_tentativas_global()
         tenta_tipo = (tentativas_por_tipo or {}).get(tipo, 0) if modo_novo else attempt
         tenta_global = tentativa_global if tentativa_global is not None else attempt
-        guardar_erro(nif, tipo, codigo, mensagem, left, data, acao="abort_month")
+        guardar_erro(nif, tipo, codigo, mensagem, left, data, acao="abort_month", run_id=run_id)
         logger.error(
             "[rate-limit] Limite por mês atingido nif=%s left_month=%s tipo %d/%d global %d/%d — a encerrar app",
             nif, left.get("month") if isinstance(left, dict) else "?", tenta_tipo, max_tipo, tenta_global, max_global,
@@ -692,7 +759,7 @@ def tratar_erro(
         max_global = get_max_tentativas_global()
         tenta_tipo = (tentativas_por_tipo or {}).get(tipo, 0) if modo_novo else attempt
         tenta_global = tentativa_global if tentativa_global is not None else attempt
-        guardar_erro(nif, tipo, codigo, mensagem, left, data, acao="abort_paid")
+        guardar_erro(nif, tipo, codigo, mensagem, left, data, acao="abort_paid", run_id=run_id)
         logger.error("[rate-limit] Créditos pagos esgotados nif=%s tipo %d/%d global %d/%d", nif, tenta_tipo, max_tipo, tenta_global, max_global)
         logger.debug("[erro] tratar_erro(%s) -> %s ABORT (%.2fs)", nif, tipo, time.perf_counter() - t)
         return {"tipo": tipo, "acao": "abort", "espera": 0, "deve_retry": False, "mensagem": mensagem, "codigo": codigo, "max_tipo": max_tipo, "max_global": max_global, "tentativas_tipo": tenta_tipo, "tentativa_global": tenta_global}
@@ -706,18 +773,18 @@ def tratar_erro(
         max_global = get_max_tentativas_global()
         tenta_tipo = (tentativas_por_tipo or {}).get(tipo, 0) if modo_novo else attempt
         tenta_global = tentativa_global if tentativa_global is not None else attempt
-        guardar_erro(nif, tipo, codigo, mensagem, left if isinstance(left, dict) else {}, data, acao="none")
+        guardar_erro(nif, tipo, codigo, mensagem, left if isinstance(left, dict) else {}, data, acao="none", run_id=run_id)
         logger.warning("[erro] Erro genérico API nif=%s tipo=%s msg='%.120s' tipo %d/%d global %d/%d", nif, tipo, mensagem, tenta_tipo, max_tipo, tenta_global, max_global)
         logger.debug("[erro] tratar_erro(%s) -> %s (%.2fs)", nif, tipo, time.perf_counter() - t)
         return {"tipo": tipo, "acao": "none", "espera": 0, "deve_retry": False, "mensagem": mensagem, "codigo": codigo, "max_tipo": max_tipo, "max_global": max_global, "tentativas_tipo": tenta_tipo, "tentativa_global": tenta_global}
 
     # fallback
-    guardar_erro(nif, tipo, codigo, mensagem, left if isinstance(left, dict) else {}, data, acao="none")
+    guardar_erro(nif, tipo, codigo, mensagem, left if isinstance(left, dict) else {}, data, acao="none", run_id=run_id)
     return {"tipo": tipo, "acao": "none", "espera": 0, "deve_retry": False, "mensagem": mensagem, "codigo": codigo, "max_tipo": 0, "max_global": get_max_tentativas_global(), "tentativas_tipo": 0, "tentativa_global": tentativa_global if tentativa_global is not None else attempt}
 
 
 # Alias para compatibilidade com enunciado: "recebe a mensagem de erro e a trata"
-def handle_error(nif: str, data: dict, attempt: int = 0, retry_count: int = 1, tentativas_por_tipo: dict | None = None, tentativa_global: int | None = None) -> dict:
+def handle_error(nif: str, data: dict, attempt: int = 0, retry_count: int = 1, tentativas_por_tipo: dict | None = None, tentativa_global: int | None = None, run_id: str | None = None) -> dict:
     """Alias de :func:`tratar_erro` (compatibilidade enunciado).
 
     Args:
@@ -735,5 +802,5 @@ def handle_error(nif: str, data: dict, attempt: int = 0, retry_count: int = 1, t
         >>> handle_error("509442013", {"result": "error", "message": "Limit per minute"})  # doctest: +SKIP
         {'tipo': 'rate_limit_minute', 'acao': 'retry', ...}
     """
-    return tratar_erro(nif, data, attempt, retry_count, tentativas_por_tipo, tentativa_global)
+    return tratar_erro(nif, data, attempt, retry_count, tentativas_por_tipo, tentativa_global, run_id)
 

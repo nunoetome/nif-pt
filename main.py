@@ -27,6 +27,7 @@ import logging
 import sys
 import time
 from Logging.logging_orchestrator import setup_logging
+from utils.run_id import ensure_run_id, extract_cli_run_id, set_run_id
 
 logger = logging.getLogger(__name__)
 
@@ -55,13 +56,18 @@ def main():
     logger_main.info("=" * 49)
     t_app = time.perf_counter()
 
+    # run_id único por execução — partilhado por futuros sub-módulos
+    _run_id = ensure_run_id(cli_value=extract_cli_run_id())
+    logger_main.info("[run] run_id=%s", _run_id)
+
     logger_main.info("-" * 49)
     logger_main.info(f"{' Modo ':-^49}")
     logger_main.info("-" * 49)
-    logger_main.info("[cli] NIF.pt - Recolha de dados")
+    logger_main.info("[cli] NIF.pt - Recolha de dados run_id=%s", _run_id[:8])
     logger_main.info("[cli] Modo: scraping / API (por definir)")
     logger_main.info("[cli] Uso direto: python consulta_nif.py <NIF> | python importar_nif_sqlite.py")
     logger_main.info("[cli] Ver MANUAL.md para instruções completas")
+    logger_main.info("[run] run_id=%s", _run_id)
 
     # BOX ajuda
     logger_main.info("-" * 49)

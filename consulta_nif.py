@@ -61,6 +61,14 @@ from pathlib import Path
 import requests
 from config.config import get_config
 from Logging.logging_orchestrator import setup_logging
+from utils.run_id import (
+    ensure_run_id,
+    extract_cli_run_id,
+    generate_run_id,
+    get_run_id,
+    remove_run_id_args,
+    set_run_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +168,7 @@ def validar_nif(nif: str) -> bool:
     return ok
 
 
-def consultar_nif(nif: str) -> dict:
+def consultar_nif(nif: str, run_id: str | None = None) -> dict:
     """Consulta a API ``nif.pt`` para o NIF dado e devolve dict normalizado.
 
     Faz ``GET {API_BASE}/?json=1&q=<nif>&key=<NIF_PT_KEY>`` com
@@ -178,6 +186,8 @@ def consultar_nif(nif: str) -> dict:
         nif: NIF com 9 dígitos (já validado opcionalmente por
             :func:`validar_nif`). Não precisa ser válido — a API é sempre
             consultada se ``NIF-PT-KEY`` existir.
+        run_id: Identificador da execução (UUID v4). Se ``None`` tenta
+            resolver via :func:`utils.run_id.get_run_id` ou gera novo.
 
     Returns:
         Dicionário com chaves estáveis (sempre presentes):
@@ -192,6 +202,7 @@ def consultar_nif(nif: str) -> dict:
         * ``creditos`` (``dict | None``) — ``data["credits"]`` (``{"used","left"}``).
         * ``tipo_erro`` (``str``) — só em erro classificado (ex.
           ``"rate_limit_minute"``).
+        * ``run_id`` (``str``) — identificador da execução (sempre presente).
 
         Em sucesso ``erro is None`` e ``valido is True``; em erro
         ``erro`` contém ``message`` ou ``result`` da API.
@@ -223,17 +234,26 @@ def consultar_nif(nif: str) -> dict:
         * ``credits.left`` pode ser ``[]`` (free plan) em vez de ``dict``.
         * Logging: TAG ``[api]`` + TIMING (R9) + BOX de resumo no :func:`main`.
     """
+    # run_id — resolve contexto ou gera novo para esta chamada
+    _run_id = run_id or get_run_id() or generate_run_id()
+    if run_id:
+        set_run_id(_run_id)
+    elif not get_run_id():
+        set_run_id(_run_id)
+
     logger.debug(f"{' consultar_nif() ':~^49}")
     t_total = time.perf_counter()
+    logger.debug("[run] run_id=%s nif=%s", _run_id, nif)
 
     if not API_KEY:
-        logger.error("[cfg] NIF-PT-KEY não encontrada no config/.env")
+        logger.error("[cfg] NIF-PT-KEY não encontrada no config/.env run_id=%s", _run_id[:8])
         return {
             "nif": nif,
             "valido": validar_nif(nif),
             "fonte": None,
             "erro": "NIF-PT-KEY não encontrada no .env",
             "dados": None,
+            "run_id": _run_id,
         }
 
     url = f"{API_BASE}/"
@@ -264,7 +284,7 @@ def consultar_nif(nif: str) -> dict:
         except requests.exceptions.Timeout:
             elapsed = time.perf_counter() - t_req
             logger.error("[api] Timeout na consulta nif.pt?q=%s após %.2fs (timeout=%s) tentativa %d/%d", nif, elapsed, TIMEOUT, tentativa_global + 1, max_global_loop + 1)
-            last_error = {"nif": nif, "valido": validar_nif(nif), "fonte": "nif.pt", "erro": "Timeout na consulta à API nif.pt", "dados": None}
+            last_error = {"nif": nif, "valido": validar_nif(nif), "fonte": "nif.pt", "erro": "Timeout na consulta à API nif.pt", "dados": None, "run_id": _run_id}
             # Timeout conta para limite global
             if tentativa_global < max_global_loop:
                 logger.warning("[api] Retry timeout em %ss (global %d/%d)", TEMPO_ESPERA, tentativa_global + 1, max_global_loop + 1)
@@ -275,7 +295,7 @@ def consultar_nif(nif: str) -> dict:
         except requests.exceptions.RequestException as e:
             elapsed = time.perf_counter() - t_req
             logger.error("[api] Erro de rede nif.pt?q=%s: %s (%.2fs) tentativa %d/%d", nif, e, elapsed, tentativa_global + 1, max_global_loop + 1)
-            last_error = {"nif": nif, "valido": validar_nif(nif), "fonte": "nif.pt", "erro": f"Erro de rede: {e}", "dados": None}
+            last_error = {"nif": nif, "valido": validar_nif(nif), "fonte": "nif.pt", "erro": f"Erro de rede: {e}", "dados": None, "run_id": _run_id}
             if tentativa_global < max_global_loop:
                 logger.warning("[api] Retry rede em %ss (global %d/%d)", TEMPO_ESPERA, tentativa_global + 1, max_global_loop + 1)
                 time.sleep(TEMPO_ESPERA)
@@ -286,7 +306,7 @@ def consultar_nif(nif: str) -> dict:
             elapsed = time.perf_counter() - t_req
             body_len = len(resp.text) if 'resp' in locals() and hasattr(resp, 'text') else 0
             logger.error("[api] Resposta não JSON de nif.pt nif=%s body_len=%d (%.2fs)", nif, body_len, elapsed)
-            return {"nif": nif, "valido": validar_nif(nif), "fonte": "nif.pt", "erro": "Resposta inválida (não JSON) da API", "dados": None}
+            return {"nif": nif, "valido": validar_nif(nif), "fonte": "nif.pt", "erro": "Resposta inválida (não JSON) da API", "dados": None, "run_id": _run_id}
 
         # Sucesso HTTP mas result pode ser error -> delega à nova camada erro
         if data.get("result") != "success":
@@ -304,6 +324,7 @@ def consultar_nif(nif: str) -> dict:
                     retry_count=RETRY_COUNT,
                     tentativas_por_tipo=tentativas_por_tipo,
                     tentativa_global=tentativa_global,
+                    run_id=_run_id,
                 )
 
                 tipo = decisao.get("tipo", "unknown")
@@ -328,6 +349,7 @@ def consultar_nif(nif: str) -> dict:
                         "erro": erro_msg,
                         "dados": data,
                         "tipo_erro": tipo,
+                        "run_id": _run_id,
                     }
 
                 # Por minuto / hora -> retry com espera configurada
@@ -350,6 +372,7 @@ def consultar_nif(nif: str) -> dict:
                         "erro": erro_msg,
                         "dados": data,
                         "tipo_erro": tipo,
+                        "run_id": _run_id,
                     }
 
                 # Genérico / retries esgotados -> devolve erro (já persistido)
@@ -363,6 +386,7 @@ def consultar_nif(nif: str) -> dict:
                         "erro": erro_msg,
                         "dados": data,
                         "tipo_erro": tipo,
+                        "run_id": _run_id,
                     }
 
             except Exception as eh_err:
@@ -376,6 +400,7 @@ def consultar_nif(nif: str) -> dict:
                     "fonte": "nif.pt",
                     "erro": erro_msg,
                     "dados": data,
+                    "run_id": _run_id,
                 }
 
         records = data.get("records", {})
@@ -394,7 +419,7 @@ def consultar_nif(nif: str) -> dict:
             creditos.get("left"),
             time.perf_counter() - t_total,
         )
-        logger.debug("[api] consultar_nif(%s) -> OK (%.2fs)", nif, time.perf_counter() - t_total)
+        logger.debug("[api] consultar_nif(%s) -> OK (%.2fs) run_id=%s", nif, time.perf_counter() - t_total, _run_id[:8])
         return {
             "nif": nif,
             "valido": True,
@@ -403,10 +428,15 @@ def consultar_nif(nif: str) -> dict:
             "dados": registo,
             "nif_valido_formato": data.get("nif_validation"),
             "creditos": data.get("credits"),
+            "run_id": _run_id,
         }
 
     # fallback se loop esgotar sem return
-    return last_error if last_error else {"nif": nif, "valido": validar_nif(nif), "fonte": "nif.pt", "erro": "Erro desconhecido", "dados": None}
+    if last_error:
+        if "run_id" not in last_error:
+            last_error["run_id"] = _run_id
+        return last_error
+    return {"nif": nif, "valido": validar_nif(nif), "fonte": "nif.pt", "erro": "Erro desconhecido", "dados": None, "run_id": _run_id}
 
 
 def main():
@@ -447,6 +477,11 @@ def main():
     logger_main.info("=" * 49)
     t_app = time.perf_counter()
 
+    # run_id — novo por execução, propagado via JSON + error_handler
+    cli_run_id = extract_cli_run_id()
+    _run_id = ensure_run_id(cli_value=cli_run_id)
+    logger_main.info("[run] run_id=%s", _run_id)
+
     # Garantir tabela de erros existe antes de consultar (idempotente)
     try:
         from utils.error_handler import init_error_table
@@ -457,24 +492,28 @@ def main():
     if TIMEOUT and TIMEOUT > 60:
         logger_main.warning("[cfg] timeout=%ss excessivo, recomendado 10s", TIMEOUT)
 
-    if len(sys.argv) < 2:
-        logger_main.error("[cli] Uso: python consulta_nif.py <NIF> (ex: 509442013)")
+    argv_clean = remove_run_id_args()
+    if len(argv_clean) < 2:
+        logger_main.error("[cli] Uso: python consulta_nif.py <NIF> [--run-id <uuid>] (ex: 509442013)")
         print(json.dumps({
             "erro": "Uso: python consulta_nif.py <NIF>",
-            "exemplo": "python consulta_nif.py 509442013"
+            "exemplo": "python consulta_nif.py 509442013",
+            "run_id": _run_id,
         }, indent=2, ensure_ascii=False))
+        logger_main.info("[run] run_id=%s", _run_id)
         logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
         logger_main.info("=" * 49)
         logger_main.info(f"{' nif-pt consulta_nif finalizado ':=^49}")
         logger_main.info("=" * 49)
         sys.exit(1)
 
-    nif = sys.argv[1].strip()
-    logger_main.info("[cli] NIF recebido: %s", nif)
+    nif = argv_clean[1].strip()
+    logger_main.info("[cli] NIF recebido: %s run_id=%s", nif, _run_id[:8])
 
     if not nif.isdigit():
         logger_main.error("[cli] NIF deve conter apenas dígitos: '%s'", nif)
-        print(json.dumps({"erro": "NIF deve conter apenas dígitos"}, indent=2, ensure_ascii=False))
+        print(json.dumps({"erro": "NIF deve conter apenas dígitos", "run_id": _run_id}, indent=2, ensure_ascii=False))
+        logger_main.info("[run] run_id=%s", _run_id)
         logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
         logger_main.info("=" * 49)
         logger_main.info(f"{' nif-pt consulta_nif finalizado ':=^49}")
@@ -486,18 +525,20 @@ def main():
         logger_main.warning("[valid] NIF %s falha validação Mod-11, mas request será enviado", nif)
 
     logger_main.debug("-" * 49)
-    resultado = consultar_nif(nif)
+    resultado = consultar_nif(nif, run_id=_run_id)
     print(json.dumps(resultado, indent=2, ensure_ascii=False))
 
     if resultado.get("erro"):
-        logger_main.error("[cli] Consulta falhou nif=%s erro=%s", nif, resultado.get("erro"))
+        logger_main.error("[cli] Consulta falhou nif=%s erro=%s run_id=%s", nif, resultado.get("erro"), _run_id[:8])
         # Box resumo erro
         logger_main.info("-" * 49)
         logger_main.info("| Consulta falhou                             |")
         logger_main.info("|---------------------------------------------|")
         logger_main.info("| NIF         : %-30s |", nif)
         logger_main.info("| Erro        : %-30s |", str(resultado.get("erro"))[:30])
+        logger_main.info("| run_id      : %-30s |", _run_id[:30])
         logger_main.info("-" * 49)
+        logger_main.info("[run] run_id=%s", _run_id)
         logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
         logger_main.info("=" * 49)
         logger_main.info(f"{' nif-pt consulta_nif finalizado ':=^49}")
@@ -515,8 +556,10 @@ def main():
     logger_main.info("| Titulo      : %-30s |", titulo)
     logger_main.info("| Valido      : %-30s |", str(resultado.get("valido")))
     logger_main.info("| Creditos    : %-30s |", str(creditos.get("used")))
+    logger_main.info("| run_id      : %-30s |", _run_id[:30])
     logger_main.info("-" * 49)
 
+    logger_main.info("[run] run_id=%s", _run_id)
     logger_main.info("Aplicação concluída em %.2fs", time.perf_counter() - t_app)
     logger_main.info("=" * 49)
     logger_main.info(f"{' nif-pt consulta_nif finalizado ':=^49}")
